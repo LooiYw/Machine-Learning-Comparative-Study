@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import time
 import os
+import pickle
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score
 
@@ -106,8 +107,7 @@ def save_results_to_csv(model_name, rmse, mae, accuracy, avg_precision, avg_reca
 
 def evaluate_model(model_name, model, X_test, y_test, test_df, k=20, threshold=3.5):
     """
-    Calculates RMSE, MAE, Classification Accuracy, and Top-K metrics,
-    and then saves them to a CSV file.
+    Calculates metrics, saves results to CSV, AND saves the trained model to a .pkl file.
     """
     print(f"\nEvaluating {model_name}...")
     start_time = time.time()
@@ -115,57 +115,49 @@ def evaluate_model(model_name, model, X_test, y_test, test_df, k=20, threshold=3
     # Predict ratings
     y_pred = model.predict(X_test)
     
-    # Append predictions back to the test dataframe for Top-N grouping
+    # Append predictions back to the test dataframe
     eval_df = test_df[['userId', 'movieId', 'rating']].copy()
     eval_df['predicted_rating'] = y_pred
     
-    # Classification logic (Rating >= 3.5 is positive class)
+    # Classification logic
     eval_df['actual_relevant'] = (eval_df['rating'] >= threshold).astype(int)
     eval_df['predicted_relevant'] = (eval_df['predicted_rating'] >= threshold).astype(int)
 
-    # 1. Error-Based Metrics
+    # 1. Error Metrics
     rmse = np.sqrt(mean_squared_error(eval_df['rating'], eval_df['predicted_rating']))
     mae = mean_absolute_error(eval_df['rating'], eval_df['predicted_rating'])
     
     # 2. Classification Accuracy
     accuracy = accuracy_score(eval_df['actual_relevant'], eval_df['predicted_relevant'])
 
-    # 3. Top-N Metrics (Precision@20, Recall@20, F1@20)
+    # 3. Top-N Metrics
     precisions, recalls = [], []
-    
     user_groups = eval_df.groupby('userId')
     for user_id, group in user_groups:
         if len(group) < k:
-            continue # Only evaluate users who have at least k interactions in the test set
-            
+            continue
         top_k = group.nlargest(k, 'predicted_rating')
         n_relevant_and_recommended = top_k['actual_relevant'].sum()
         n_total_relevant = group['actual_relevant'].sum()
         
-        # Precision @ K
-        prec = n_relevant_and_recommended / k
-        precisions.append(prec)
-        
-        # Recall @ K
-        rec = n_relevant_and_recommended / n_total_relevant if n_total_relevant != 0 else 0
-        recalls.append(rec)
+        precisions.append(n_relevant_and_recommended / k)
+        recalls.append(n_relevant_and_recommended / n_total_relevant if n_total_relevant != 0 else 0)
 
     avg_precision = np.mean(precisions) if precisions else 0
     avg_recall = np.mean(recalls) if recalls else 0
     f1_score = (2 * avg_precision * avg_recall) / (avg_precision + avg_recall) if (avg_precision + avg_recall) != 0 else 0
 
     print(f"Evaluation finished in {time.time() - start_time:.2f} seconds")
-    print("=" * 40)
-    print(f"--- {model_name} Results ---")
-    print("[Error-Based Metrics]")
-    print(f"RMSE: {rmse:.4f}")
-    print(f"MAE:  {mae:.4f}")
-    print("\n[Classification-Based Metrics]")
-    print(f"Classification Accuracy: {accuracy:.4f}")
-    print(f"Precision@{k}: {avg_precision:.4f}")
-    print(f"Recall@{k}:    {avg_recall:.4f}")
-    print(f"F1-Score@{k}:  {f1_score:.4f}")
-    print("=" * 40)
     
-    # Automatically save to CSV
+    # Save the results to CSV
     save_results_to_csv(model_name, rmse, mae, accuracy, avg_precision, avg_recall, f1_score, k)
+    
+    # SAVE THE TRADITIONAL MODEL (.pkl format)
+    os.makedirs('saved_models', exist_ok=True)
+    safe_name = model_name.replace(" ", "_").lower()
+    model_path = f'saved_models/{safe_name}_model.pkl'
+    
+    with open(model_path, 'wb') as file:
+        pickle.dump(model, file)
+        
+    print(f"[+] Model successfully saved to {model_path}")

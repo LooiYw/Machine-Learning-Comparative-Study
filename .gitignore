@@ -1,0 +1,8 @@
+# Ignore saved machine learning models
+saved_models/
+*.pkl
+*.joblib
+
+# Ignore dataset files (datasets are usually too big for GitHub too)
+data/
+*.csv
