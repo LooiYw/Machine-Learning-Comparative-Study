@@ -1,0 +1,4 @@
+Model Name,RMSE,MAE,Classification Accuracy,Precision@20,Recall@20,F1-Score@20
+Decision Tree,1.1621,0.8592,0.6747,0.5902,0.7783,0.6713
+Random Forest,0.8831,0.671,0.7111,0.6278,0.8245,0.7128
+XGBoost,0.828,0.6276,0.7372,0.6368,0.8357,0.7228
