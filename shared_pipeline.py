@@ -5,24 +5,14 @@ import os
 import pickle
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score
+from preprocessing import (
+    load_movies,
+    load_ratings,
+    load_tags
+)
 
 # ==========================================
-# 1. DATA LOADING 
-# ==========================================
-def load_ratings():
-    start_time = time.time()
-    df = pd.read_csv("data/ratings.csv", engine="pyarrow")
-    print(f"Loaded ratings in {time.time() - start_time:.2f} seconds")
-    return df
-
-def load_movies():
-    start_time = time.time()
-    df = pd.read_csv("data/movies.csv", engine="pyarrow")
-    print(f"Loaded movies in {time.time() - start_time:.2f} seconds")
-    return df
-
-# ==========================================
-# 2. MODEL PREPROCESSING (Feature Engineering)
+# 1. MODEL PREPROCESSING (Feature Engineering)
 # ==========================================
 def prepare_traditional_features(sample_fraction=0.1):
     """
@@ -76,7 +66,7 @@ def prepare_traditional_features(sample_fraction=0.1):
     return X_train, X_test, y_train, y_test, test_df
 
 # ==========================================
-# 3. EVALUATION & RESULT SAVING
+# 2. EVALUATION & RESULT SAVING
 # ==========================================
 def save_results_to_csv(model_name, rmse, mae, accuracy, avg_precision, avg_recall, f1_score, k):
     """

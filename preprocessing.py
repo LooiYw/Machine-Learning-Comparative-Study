@@ -75,12 +75,15 @@ def main():
     movies = load_movies()
     links = load_links()
     tags = load_tags()
+    
+    print(movies[movies["movieId"] == 1])
+    print(tags[tags["movieId"] == 1])
 
     #region Inspect datasets
     # inspect_dataset(ratings, "Ratings") #32000204 rows
     # inspect_dataset(movies, "Movies Metadata")
     # inspect_dataset(keywords, "Keywords")
-    inspect_dataset(tags, "Tags")
+    # inspect_dataset(tags, "Tags")
     #endregion
 
 if __name__ == "__main__":
