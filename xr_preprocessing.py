@@ -1,100 +1,142 @@
 import pandas as pd
 import numpy as np
+import os
+import pickle
 from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import StandardScaler
-from scipy.sparse import hstack, csr_matrix
-from preprocessing import load_ratings, load_movies, load_tags
+from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score
+from shared_pipeline import load_movies, load_ratings, load_tags
+from preprocessing import build_tag_features
 
-def get_base_split(sample_fraction=0.05):
-    """
-    Loads ratings, applies sampling, extracts timestamp features, 
-    and performs a consistent 80/20 train-test split.
-    """
-    print(f"\n--- Loading & Splitting Data (Fraction: {sample_fraction}) ---")
-    ratings = load_ratings()
+# ==========================================
+# 1. DATA CLEANING (ROBUSTNESS TESTING)
+# ==========================================
+def apply_data_cleaning(ratings, min_ratings=5, max_ratings_per_day=500):
+    print("\n[+] Applying Preprocessing Pipeline (Cleaning Data)...")
     
-    if sample_fraction < 1.0:
-        ratings = ratings.sample(frac=sample_fraction, random_state=42)
-        
-    # 1. USE TIMESTAMP: Convert Unix timestamp to meaningful temporal features
-    dt = pd.to_datetime(ratings['timestamp'], unit='s')
-    ratings['rating_year'] = dt.dt.year
-    ratings['rating_month'] = dt.dt.month
-    ratings['rating_dayofweek'] = dt.dt.dayofweek
-    # Days since the earliest rating in the sample
-    ratings['days_since_start'] = (ratings['timestamp'] - ratings['timestamp'].min()) / 86400.0
+    # Filter suspicious users (bot/shilling attacks)
+    user_counts = ratings['userId'].value_counts()
+    suspicious_users = user_counts[user_counts > max_ratings_per_day].index
+    ratings = ratings[~ratings['userId'].isin(suspicious_users)]
+
+    user_std = ratings.groupby('userId')['rating'].std()
+    zero_variance_users = user_std[user_std == 0].index
+    ratings = ratings[~ratings['userId'].isin(zero_variance_users)]
+
+    # Drop sparse data
+    active_users = user_counts[user_counts >= min_ratings].index
+    ratings = ratings[ratings['userId'].isin(active_users)]
     
-    train_df, test_df = train_test_split(ratings, test_size=0.2, random_state=42)
-    return train_df.copy(), test_df.copy()
+    movie_counts = ratings['movieId'].value_counts()
+    popular_movies = movie_counts[movie_counts >= min_ratings].index
+    ratings = ratings[ratings['movieId'].isin(popular_movies)]
 
+    # Normalize bias
+    user_means = ratings.groupby('userId')['rating'].transform('mean')
+    ratings['rating_normalized'] = ratings['rating'] - user_means
+    
+    return ratings
 
-def prepare_svm_features(sample_fraction=0.02, max_tag_features=100):
-    """
-    Builds sparse feature matrices for SVM using:
-    - Leakage-free User & Movie stats
-    - Timestamp features
-    - Movie genres
-    - Aggregated user-generated tags from tags.csv (TF-IDF)
-    """
-    train_df, test_df = get_base_split(sample_fraction=sample_fraction)
+# ==========================================
+# 2. FEATURE PREPARATION
+# ==========================================
+def prepare_xr_features(sample_fraction=0.1, top_n_tags=50, clean_data=False):
+    # clean_data=False represents "Before Cleaning / Corrupted Data"
+    # clean_data=True represents "After Cleaning / Robust Data"
+    
+    ratings = load_ratings().sample(frac=sample_fraction, random_state=42)
     movies = load_movies()
     tags = load_tags()
-    
-    # 2. LEAKAGE-FREE STATS (Computed ONLY on train_df)
-    global_mean = train_df['rating'].mean()
-    user_stats = train_df.groupby('userId')['rating'].agg(['mean', 'count']).rename(
+
+    if clean_data:
+        ratings = apply_data_cleaning(ratings)
+        target_column = 'rating_normalized'
+    else:
+        print("\n[-] Using Corrupted/Before Cleaning Data...")
+        target_column = 'rating'
+
+    user_stats = ratings.groupby('userId')['rating'].agg(['mean', 'count']).rename(
         columns={'mean': 'user_avg', 'count': 'user_activity'}
     )
-    movie_stats = train_df.groupby('movieId')['rating'].agg(['mean', 'count']).rename(
+    movie_stats = ratings.groupby('movieId')['rating'].agg(['mean', 'count']).rename(
         columns={'mean': 'movie_avg', 'count': 'movie_popularity'}
     )
     
-    # 3. USE TAGS.CSV: Group all tags per movie into a single document
-    tags['tag'] = tags['tag'].fillna('').astype(str)
-    movie_tags = tags.groupby('movieId')['tag'].apply(lambda x: ' '.join(x)).reset_index()
+    movie_tag_features, user_tag_features = build_tag_features(tags, top_n_tags=top_n_tags)
     
-    # One-hot encode genres
+    df = ratings.join(user_stats, on='userId').join(movie_stats, on='movieId').join(user_tag_features, on='userId')
+    
     movies['genres'] = movies['genres'].fillna('None')
     genres_encoded = movies['genres'].str.get_dummies(sep='|')
-    movies_meta = pd.concat([movies[['movieId']], genres_encoded], axis=1)
-    movies_meta = movies_meta.merge(movie_tags, on='movieId', how='left')
-    movies_meta['tag'] = movies_meta['tag'].fillna('')
+    movies_features = pd.concat([movies[['movieId']], genres_encoded], axis=1)
     
-    # Merge features into train and test
-    def enrich(df):
-        df = df.join(user_stats, on='userId').join(movie_stats, on='movieId')
-        df['user_avg'] = df['user_avg'].fillna(global_mean)
-        df['movie_avg'] = df['movie_avg'].fillna(global_mean)
-        df['user_activity'] = df['user_activity'].fillna(0)
-        df['movie_popularity'] = df['movie_popularity'].fillna(0)
-        df = df.merge(movies_meta, on='movieId', how='left')
-        df['tag'] = df['tag'].fillna('')
-        return df
+    df = df.merge(movies_features, on='movieId', how='left').join(movie_tag_features, on='movieId').fillna(0)
+    
+    drop_cols = ['rating', 'timestamp', 'userId', 'movieId']
+    if 'rating_normalized' in df.columns:
+        drop_cols.append('rating_normalized')
+        
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+    return train_df.drop(columns=drop_cols), test_df.drop(columns=drop_cols), train_df[target_column], test_df[target_column], test_df
 
-    train_enriched = enrich(train_df)
-    test_enriched = enrich(test_df)
+# ==========================================
+# 3. EVALUATION
+# ==========================================
+def evaluate_xr_model(model_name, model, X_test, y_test, test_df, training_time, k=20, threshold=3.5):
+    print(f"\nEvaluating {model_name}...")
     
-    # TF-IDF on tags (Fit on train ONLY, transform test)
-    print("Vectorizing tags with TF-IDF...")
-    tfidf = TfidfVectorizer(max_features=max_tag_features, stop_words='english')
-    X_train_tags = tfidf.fit_transform(train_enriched['tag'])
-    X_test_tags = tfidf.transform(test_enriched['tag'])
+    y_pred = model.predict(X_test)
+    eval_df = test_df[['userId', 'movieId', 'rating']].copy()
+    eval_df['predicted_rating'] = y_pred
     
-    # Numeric & Genre columns
-    drop_cols = ['userId', 'movieId', 'rating', 'timestamp', 'tag']
-    num_cols = [c for c in train_enriched.columns if c not in drop_cols]
+    # 1. RMSE & MAE
+    rmse = np.sqrt(mean_squared_error(eval_df['rating'], eval_df['predicted_rating']))
+    mae = mean_absolute_error(eval_df['rating'], eval_df['predicted_rating'])
     
-    # Scale numeric features (Critical for SVM convergence)
-    scaler = StandardScaler()
-    X_train_num = csr_matrix(scaler.fit_transform(train_enriched[num_cols].fillna(0)))
-    X_test_num = csr_matrix(scaler.transform(test_enriched[num_cols].fillna(0)))
+    # 2. Classification Accuracy
+    eval_df['actual_relevant'] = (eval_df['rating'] >= threshold).astype(int)
+    eval_df['predicted_relevant'] = (eval_df['predicted_rating'] >= threshold).astype(int)
+    accuracy = accuracy_score(eval_df['actual_relevant'], eval_df['predicted_relevant'])
+
+    # 3. Precision@K, Recall@K, F1-Score@K
+    def calculate_top_k(group):
+        total_relevant = group['actual_relevant'].sum()
+        if total_relevant == 0:
+            return pd.Series({'precision': np.nan, 'recall': np.nan})
+        
+        top_k_items = group.nlargest(k, 'predicted_rating')
+        hits = top_k_items['actual_relevant'].sum()
+        
+        precision = hits / k
+        recall = hits / total_relevant
+        return pd.Series({'precision': precision, 'recall': recall})
+
+    user_metrics = eval_df.groupby('userId').apply(calculate_top_k).dropna()
+    precision_k = user_metrics['precision'].mean()
+    recall_k = user_metrics['recall'].mean()
     
-    # Combine sparse numeric/genre matrix with sparse TF-IDF matrix
-    X_train = hstack([X_train_num, X_train_tags]).tocsr()
-    X_test = hstack([X_test_num, X_test_tags]).tocsr()
+    if (precision_k + recall_k) > 0:
+        f1_k = 2 * (precision_k * recall_k) / (precision_k + recall_k)
+    else:
+        f1_k = 0.0
+
+    # Save to CSV exactly matching the image columns
+    os.makedirs('results', exist_ok=True)
+    file_path = 'results/xr_model_results.csv'
+    results_df = pd.DataFrame({
+        'Model Name': [model_name], 
+        'RMSE': [round(rmse, 4)], 
+        'MAE': [round(mae, 4)],
+        'Classification Accuracy': [round(accuracy, 4)], 
+        f'Precision@{k}': [round(precision_k, 4)], 
+        f'Recall@{k}': [round(recall_k, 4)], 
+        f'F1-Score@{k}': [round(f1_k, 4)]
+    })
+    results_df.to_csv(file_path, mode='a', header=not os.path.isfile(file_path), index=False)
     
-    y_train = train_enriched['rating'].values
-    y_test = test_enriched['rating'].values
-    
-    return X_train, X_test, y_train, y_test, test_enriched
+    # Save Model
+    os.makedirs('models', exist_ok=True)
+    safe_name = model_name.replace(" ", "_").lower()
+    with open(f'models/{safe_name}.pkl', 'wb') as f:
+        pickle.dump(model, f)
+        
+    print(f"[+] Saved {model_name} metrics to results/xr_model_results.csv")

@@ -1,26 +1,30 @@
 import time
-from surprise import Dataset, Reader, NMF
-from xr_preprocessing import get_base_split
+from sklearn.decomposition import NMF
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from xr_preprocessing import prepare_xr_features
 from shared_pipeline import evaluate_model
-from models.svd import SurpriseWrapper  # Reuses the parallel wrapper
 
 def run_nmf():
-    print("=== MODEL: NMF (Non-Negative Matrix Factorization) ===")
-    train_df, test_df = get_base_split(sample_fraction=0.1)
-    
-    reader = Reader(rating_scale=(0.5, 5.0))
-    train_data = Dataset.load_from_df(train_df[['userId', 'movieId', 'rating']], reader)
-    trainset = train_data.build_full_trainset()
-    
-    nmf_algo = NMF(n_factors=30, n_epochs=25, biased=True, random_state=42)
-    
-    print("\nTraining NMF...")
-    start_time = time.time()
-    nmf_algo.fit(trainset)
-    print(f"Training completed in {time.time() - start_time:.2f} seconds")
-    
-    wrapped_model = SurpriseWrapper(nmf_algo)
-    evaluate_model("NMF", wrapped_model, test_df, test_df['rating'].values, test_df, k=20)
+    for is_clean in [False, True]:
+        condition = "CLEANED" if is_clean else "CORRUPTED"
+        print(f"\n=== MODEL: NMF ({condition} DATA) ===")
+        
+        X_train, X_test, y_train, y_test, test_df = prepare_xr_features(clean_data=is_clean)
+        
+        nmf_model = Pipeline([
+            ('nmf', NMF(n_components=20, init='nndsvda', random_state=42, max_iter=500)),
+            ('regressor', Ridge(random_state=42))
+        ])
+        
+        start_time = time.time()
+        print("Training NMF Pipeline...")
+        nmf_model.fit(X_train, y_train)
+        end_time = time.time() - start_time
+        print(f"Training completed in {end_time:.2f} seconds")
+        
+        model_name = f"NMF_{condition}"
+        evaluate_model(model_name, nmf_model, X_test, y_test, test_df, end_time, k=20)
 
 if __name__ == "__main__":
     run_nmf()

@@ -1,51 +1,30 @@
 import time
-import numpy as np
-from joblib import Parallel, delayed
-from surprise import Dataset, Reader, SVD
-from xr_preprocessing import get_base_split
+from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from xr_preprocessing import prepare_xr_features
 from shared_pipeline import evaluate_model
 
-class SurpriseWrapper:
-    """Wraps Surprise models to support .predict(X_test) and parallel inference."""
-    def __init__(self, algo):
-        self.algo = algo
-
-    def _predict_chunk(self, uids, iids):
-        return [self.algo.predict(u, i).est for u, i in zip(uids, iids)]
-
-    def predict(self, X_test):
-        # X_test is expected to have 'userId' and 'movieId'
-        uids = X_test['userId'].values
-        iids = X_test['movieId'].values
-        
-        # Parallelize prediction across all CPU cores
-        n_jobs = 8
-        uid_chunks = np.array_split(uids, n_jobs)
-        iid_chunks = np.array_split(iids, n_jobs)
-        
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(self._predict_chunk)(u_c, i_c) 
-            for u_c, i_c in zip(uid_chunks, iid_chunks)
-        )
-        return np.concatenate(results)
-
 def run_svd():
-    print("=== MODEL: SVD (Matrix Factorization) ===")
-    train_df, test_df = get_base_split(sample_fraction=0.1)
-    
-    reader = Reader(rating_scale=(0.5, 5.0))
-    train_data = Dataset.load_from_df(train_df[['userId', 'movieId', 'rating']], reader)
-    trainset = train_data.build_full_trainset()
-    
-    svd_algo = SVD(n_factors=50, n_epochs=20, lr_all=0.005, reg_all=0.02, random_state=42)
-    
-    print("\nTraining SVD...")
-    start_time = time.time()
-    svd_algo.fit(trainset)
-    print(f"Training completed in {time.time() - start_time:.2f} seconds")
-    
-    wrapped_model = SurpriseWrapper(svd_algo)
-    evaluate_model("SVD", wrapped_model, test_df, test_df['rating'].values, test_df, k=20)
+    for is_clean in [False, True]:
+        condition = "CLEANED" if is_clean else "CORRUPTED"
+        print(f"\n=== MODEL: SVD ({condition} DATA) ===")
+        
+        X_train, X_test, y_train, y_test, test_df = prepare_xr_features(clean_data=is_clean)
+        
+        svd_model = Pipeline([
+            ('svd', TruncatedSVD(n_components=20, random_state=42)),
+            ('regressor', Ridge(random_state=42))
+        ])
+        
+        start_time = time.time()
+        print("Training SVD Pipeline...")
+        svd_model.fit(X_train, y_train)
+        end_time = time.time() - start_time
+        print(f"Training completed in {end_time:.2f} seconds")
+        
+        model_name = f"SVD_{condition}"
+        evaluate_model(model_name, svd_model, X_test, y_test, test_df, end_time, k=20)
 
 if __name__ == "__main__":
     run_svd()
