@@ -6,3 +6,4 @@ saved_models/
 # Ignore dataset files (datasets are usually too big for GitHub too)
 data/
 *.csv
+*.pkl
