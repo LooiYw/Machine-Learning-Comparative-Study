@@ -14,15 +14,58 @@ from preprocessing import (
 # ==========================================
 # 1. MODEL PREPROCESSING (Feature Engineering)
 # ==========================================
-def prepare_traditional_features(sample_fraction=0.1):
+def build_tag_features(tags, top_n_tags=50):
+    """
+    Builds tag-based features from tags.csv (columns: userId, movieId, tag, timestamp).
+
+    Returns two DataFrames:
+      - movie_tag_features (index=movieId):
+            movie_tag_count   : total number of tags applied to the movie
+            movie_unique_tags : number of distinct tags applied to the movie
+            tag_<name>        : 1 if the movie has received that tag (top_n_tags most frequent tags)
+      - user_tag_features (index=userId):
+            user_tag_count    : how many tags the user has written (engagement signal)
+    """
+    tags = tags.dropna(subset=['tag']).copy()
+    tags['tag'] = tags['tag'].astype(str).str.lower().str.strip()
+    tags = tags[tags['tag'] != '']
+
+    # --- Movie-level counts ---
+    movie_tag_stats = tags.groupby('movieId')['tag'].agg(
+        movie_tag_count='count',
+        movie_unique_tags='nunique'
+    )
+
+    # --- Top-N tags as binary columns per movie ---
+    top_tags = tags['tag'].value_counts().head(top_n_tags).index
+    top_df = tags[tags['tag'].isin(top_tags)]
+    tag_matrix = (
+        top_df.groupby(['movieId', 'tag']).size().unstack(fill_value=0)
+    )
+    tag_matrix = (tag_matrix > 0).astype(np.int8)
+    # Prefix avoids collisions with genre column names (e.g. genre "Comedy" vs tag "comedy")
+    tag_matrix.columns = [f"tag_{c}" for c in tag_matrix.columns]
+
+    movie_tag_features = movie_tag_stats.join(tag_matrix, how='left').fillna(0)
+
+    # --- User-level tag activity ---
+    user_tag_features = tags.groupby('userId').size().to_frame('user_tag_count')
+
+    return movie_tag_features, user_tag_features
+
+
+def prepare_traditional_features(sample_fraction=0.1, top_n_tags=50):
     """
     Tree models cannot handle raw IDs. We must create statistical features.
     Note: sample_fraction is set to 10% by default to prevent memory crashes on 32M rows.
     Change to 1.0 when running on a high-RAM server.
+
+    top_n_tags: number of most frequent tags (from tags.csv) to one-hot encode per movie.
     """
     print("\n--- Starting Feature Engineering ---")
     ratings = load_ratings()
     movies = load_movies()
+    tags = load_tags()
     
     # Sample data to manage memory during development testing
     ratings = ratings.sample(frac=sample_fraction, random_state=42)
@@ -37,17 +80,28 @@ def prepare_traditional_features(sample_fraction=0.1):
         columns={'mean': 'movie_avg', 'count': 'movie_popularity'}
     )
     
+    # Create Tag Features (from tags.csv)
+    print("Building tag features...")
+    movie_tag_features, user_tag_features = build_tag_features(tags, top_n_tags=top_n_tags)
+    del tags  # free memory
+    
     # Merge stats into main dataframe
-    df = ratings.join(user_stats, on='userId').join(movie_stats, on='movieId')
+    df = (
+        ratings
+        .join(user_stats, on='userId')
+        .join(movie_stats, on='movieId')
+        .join(user_tag_features, on='userId')
+    )
     
     # One-Hot Encode Genres
     movies['genres'] = movies['genres'].fillna('None')
     genres_encoded = movies['genres'].str.get_dummies(sep='|')
     movies_features = pd.concat([movies[['movieId']], genres_encoded], axis=1)
     
-    # Final Merge
+    # Final Merge (genres + movie-level tag features)
     df = df.merge(movies_features, on='movieId', how='left')
-    df = df.fillna(0) # Handle any missing values safely
+    df = df.join(movie_tag_features, on='movieId')
+    df = df.fillna(0)  # Users/movies with no tags (or any other gaps) get 0
     
     # Define Features (X) and Target (y)
     # Drop timestamp and string labels; keep IDs only for the test set evaluation later
@@ -68,14 +122,14 @@ def prepare_traditional_features(sample_fraction=0.1):
 # ==========================================
 # 2. EVALUATION & RESULT SAVING
 # ==========================================
-def save_results_to_csv(model_name, rmse, mae, accuracy, avg_precision, avg_recall, f1_score, k):
-    """
-    Saves the evaluation metrics to a CSV file.
-    Creates the directory and file if they don't exist, appends if they do.
-    """
+
+
+def save_results_to_csv(model_name, rmse, mae, accuracy, avg_precision, avg_recall, f1_score, k,
+                        training_time_seconds):
+
     os.makedirs('results', exist_ok=True)
     file_path = 'results/model_evaluation_results.csv'
-    
+
     results_dict = {
         'Model Name': [model_name],
         'RMSE': [round(rmse, 4)],
@@ -83,19 +137,27 @@ def save_results_to_csv(model_name, rmse, mae, accuracy, avg_precision, avg_reca
         'Classification Accuracy': [round(accuracy, 4)],
         f'Precision@{k}': [round(avg_precision, 4)],
         f'Recall@{k}': [round(avg_recall, 4)],
-        f'F1-Score@{k}': [round(f1_score, 4)]
+        f'F1-Score@{k}': [round(f1_score, 4)],
+        'Training Time (s)': [round(training_time_seconds, 4)],
     }
-    
+
     results_df = pd.DataFrame(results_dict)
-    
-    if os.path.isfile(file_path):
-        results_df.to_csv(file_path, mode='a', header=False, index=False)
-    else:
-        results_df.to_csv(file_path, mode='w', header=True, index=False)
-        
+
+    file_exists = os.path.isfile(file_path)
+
+    results_df.to_csv(
+        file_path,
+        mode='a' ,
+        header=not file_exists,
+        index=False,
+        lineterminator='\n'
+    )
+
     print(f"[+] Results successfully saved to {file_path}")
 
-def evaluate_model(model_name, model, X_test, y_test, test_df, k=20, threshold=3.5):
+
+
+def evaluate_model(model_name, model, X_test, y_test, test_df, training_time_seconds, k=20, threshold=3.5):
     """
     Calculates metrics, saves results to CSV, AND saves the trained model to a .pkl file.
     """
@@ -140,7 +202,8 @@ def evaluate_model(model_name, model, X_test, y_test, test_df, k=20, threshold=3
     print(f"Evaluation finished in {time.time() - start_time:.2f} seconds")
     
     # Save the results to CSV
-    save_results_to_csv(model_name, rmse, mae, accuracy, avg_precision, avg_recall, f1_score, k)
+
+    save_results_to_csv(model_name, rmse, mae, accuracy,avg_precision, avg_recall, f1_score, k,training_time_seconds)
     
     # SAVE THE TRADITIONAL MODEL (.pkl format)
     os.makedirs('saved_models', exist_ok=True)

@@ -3,6 +3,7 @@ import xgboost as xgb
 from shared_pipeline import prepare_traditional_features, evaluate_model
 
 def run_xgboost():
+
     print("=== MODEL 3: XGBOOST ===")
     X_train, X_test, y_train, y_test, test_df = prepare_traditional_features()
     
@@ -19,10 +20,11 @@ def run_xgboost():
     print("\nTraining XGBoost (Parallel Processing Enabled)...")
     start_time = time.time()
     xgb_model.fit(X_train, y_train)
-    print(f"Training completed in {time.time() - start_time:.2f} seconds")
+    end_time = time.time() - start_time
+    print(f"Training completed in {end_time:.2f} seconds")
     
     # Evaluate
-    evaluate_model("XGBoost", xgb_model, X_test, y_test, test_df, k=20)
+    evaluate_model("XGBoost", xgb_model, X_test, y_test, test_df, end_time, k=20)
 
 if __name__ == "__main__":
     run_xgboost()

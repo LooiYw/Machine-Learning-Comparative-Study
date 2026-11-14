@@ -13,10 +13,11 @@ def run_decision_tree():
     print("\nTraining Decision Tree...")
     start_time = time.time()
     dt_model.fit(X_train, y_train)
-    print(f"Training completed in {time.time() - start_time:.2f} seconds")
+    end_time = time.time() - start_time
+    print(f"Training completed in {end_time:.2f} seconds")
     
     # Evaluate
-    evaluate_model("Decision Tree", dt_model, X_test, y_test, test_df, k=20)
+    evaluate_model("Decision Tree", dt_model, X_test, y_test, test_df, end_time, k=20)
 
 if __name__ == "__main__":
     run_decision_tree()
