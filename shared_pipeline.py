@@ -169,7 +169,13 @@ def evaluate_model(model_name, model, X_test, y_test, test_df, training_time_sec
     
     # Append predictions back to the test dataframe
     eval_df = test_df[['userId', 'movieId', 'rating']].copy()
-    eval_df['predicted_rating'] = y_pred
+    
+    # FIX: Denormalize predictions if they are centered around 0 (Cleaned Data)
+    # Uses test_df.columns to prevent errors when X_test is a NumPy array (like in SVM)
+    if y_pred.mean() < 1.0 and 'user_avg' in test_df.columns:
+        eval_df['predicted_rating'] = y_pred + test_df['user_avg'].values
+    else:
+        eval_df['predicted_rating'] = y_pred
     
     # Classification logic
     eval_df['actual_relevant'] = (eval_df['rating'] >= threshold).astype(int)
@@ -202,7 +208,6 @@ def evaluate_model(model_name, model, X_test, y_test, test_df, training_time_sec
     print(f"Evaluation finished in {time.time() - start_time:.2f} seconds")
     
     # Save the results to CSV
-
     save_results_to_csv(model_name, rmse, mae, accuracy,avg_precision, avg_recall, f1_score, k,training_time_seconds)
     
     # SAVE THE TRADITIONAL MODEL (.pkl format)
