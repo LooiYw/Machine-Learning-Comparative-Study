@@ -1,7 +1,7 @@
 import time
 from sklearn.svm import LinearSVR
 from sklearn.preprocessing import StandardScaler
-from xr_preprocessing import prepare_xr_features
+from preprocessing import prepare_xr_features
 from shared_pipeline import evaluate_model
 
 def run_svm():

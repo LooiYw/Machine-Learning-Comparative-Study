@@ -1,5 +1,5 @@
 import time
-import xgboost as xgb
+from xgboost import XGBRegressor
 from shared_pipeline import prepare_traditional_features, evaluate_model
 
 def run_xgboost():
@@ -8,7 +8,7 @@ def run_xgboost():
     X_train, X_test, y_train, y_test, test_df = prepare_traditional_features()
     
     # Initialize model with parallel processing and histogram binning for speed
-    xgb_model = xgb.XGBRegressor(
+    xgb_model = XGBRegressor(
         objective='reg:squarederror', 
         n_estimators=100, 
         random_state=42,

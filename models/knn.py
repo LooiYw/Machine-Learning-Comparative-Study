@@ -1,6 +1,6 @@
 import time
 from sklearn.neighbors import KNeighborsRegressor
-from xr_preprocessing import prepare_xr_features
+from preprocessing import prepare_xr_features
 from shared_pipeline import evaluate_model
 
 def run_knn():

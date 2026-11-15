@@ -2,7 +2,7 @@ import time
 from sklearn.decomposition import NMF
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
-from xr_preprocessing import prepare_xr_features
+from preprocessing import prepare_xr_features
 from shared_pipeline import evaluate_model
 
 def run_nmf():

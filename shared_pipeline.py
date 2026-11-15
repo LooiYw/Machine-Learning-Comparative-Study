@@ -214,3 +214,63 @@ def evaluate_model(model_name, model, X_test, y_test, test_df, training_time_sec
         pickle.dump(model, file)
         
     print(f"[+] Model successfully saved to {model_path}")
+    
+def evaluate_xr_model(model_name, model, X_test, y_test, test_df, training_time, k=20, threshold=3.5):
+    print(f"\nEvaluating {model_name}...")
+    
+    y_pred = model.predict(X_test)
+    eval_df = test_df[['userId', 'movieId', 'rating']].copy()
+    eval_df['predicted_rating'] = y_pred
+    
+    # 1. RMSE & MAE
+    rmse = np.sqrt(mean_squared_error(eval_df['rating'], eval_df['predicted_rating']))
+    mae = mean_absolute_error(eval_df['rating'], eval_df['predicted_rating'])
+    
+    # 2. Classification Accuracy
+    eval_df['actual_relevant'] = (eval_df['rating'] >= threshold).astype(int)
+    eval_df['predicted_relevant'] = (eval_df['predicted_rating'] >= threshold).astype(int)
+    accuracy = accuracy_score(eval_df['actual_relevant'], eval_df['predicted_relevant'])
+
+    # 3. Precision@K, Recall@K, F1-Score@K
+    def calculate_top_k(group):
+        total_relevant = group['actual_relevant'].sum()
+        if total_relevant == 0:
+            return pd.Series({'precision': np.nan, 'recall': np.nan})
+        
+        top_k_items = group.nlargest(k, 'predicted_rating')
+        hits = top_k_items['actual_relevant'].sum()
+        
+        precision = hits / k
+        recall = hits / total_relevant
+        return pd.Series({'precision': precision, 'recall': recall})
+
+    user_metrics = eval_df.groupby('userId').apply(calculate_top_k).dropna()
+    precision_k = user_metrics['precision'].mean()
+    recall_k = user_metrics['recall'].mean()
+    
+    if (precision_k + recall_k) > 0:
+        f1_k = 2 * (precision_k * recall_k) / (precision_k + recall_k)
+    else:
+        f1_k = 0.0
+
+    # Save to CSV exactly matching the image columns
+    os.makedirs('results', exist_ok=True)
+    file_path = 'results/xr_model_results.csv'
+    results_df = pd.DataFrame({
+        'Model Name': [model_name], 
+        'RMSE': [round(rmse, 4)], 
+        'MAE': [round(mae, 4)],
+        'Classification Accuracy': [round(accuracy, 4)], 
+        f'Precision@{k}': [round(precision_k, 4)], 
+        f'Recall@{k}': [round(recall_k, 4)], 
+        f'F1-Score@{k}': [round(f1_k, 4)]
+    })
+    results_df.to_csv(file_path, mode='a', header=not os.path.isfile(file_path), index=False)
+    
+    # Save Model
+    os.makedirs('models', exist_ok=True)
+    safe_name = model_name.replace(" ", "_").lower()
+    with open(f'models/{safe_name}.pkl', 'wb') as f:
+        pickle.dump(model, f)
+        
+    print(f"[+] Saved {model_name} metrics to results/xr_model_results.csv")
