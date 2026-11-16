@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import time as time
 from sklearn.model_selection import train_test_split
 
 
@@ -22,26 +23,7 @@ def load_tags():
 
 #endregion
 
-def inspect_dataset(dataframe, file_name):
-    start_time = time.time()
-    print(file_name, " Dataset Dimensions")
-    rows, columns = dataframe.shape
-    print("=" * 20)
-    print("Number of rows: ", rows)
-    print("Number of columns: ", columns)
-    print("=" * 20)
-    print("\nData Type")
-    print(dataframe.dtypes)
-    print("=" * 20)
-    print("\nMissing Values")
-    missing_values = pd.DataFrame({"Missing Count": dataframe.isnull().sum()})
-    print(missing_values)
-    print("=" * 20)
-    print("\nFirst 3 Records:")
-    print(dataframe.head())
-    print("=" * 20)
-    end_time = time.time() - start_time
-    print("Total Inspection Time for", file_name, f": {end_time:.2f} seconds")
+
 
 # ==========================================
 # 2. DATA CLEANING PIPELINE
@@ -155,3 +137,4 @@ def prepare_cleaned_features(sample_fraction=0.1, top_n_tags=50):
     ratings = load_ratings().sample(frac=sample_fraction, random_state=42)
     ratings = apply_data_cleaning(ratings)
     return _build_dataset(ratings, load_movies(), load_tags(), top_n_tags, target_column='rating_normalized')
+
