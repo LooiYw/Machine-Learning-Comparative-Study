@@ -1,19 +1,22 @@
 import pandas as pd
 import numpy as np
+import os
 import time as time
 from sklearn.model_selection import train_test_split
 
+def load_ratings():
+    start_time = time.time()
+    df = pd.read_csv("data/ratings.csv", engine="pyarrow")
+    print(f"Loaded ratings in {time.time() - start_time:.2f} seconds")
+    return df
 
-# ==========================================
-# 1. DATA LOADING METHODS
-# ==========================================
 
-# These methods load the raw CSV files using PyArrow for faster reading.
-def load_ratings(): 
-    return pd.read_csv("data/ratings.csv", engine="pyarrow")
+def load_movies():
+    start_time = time.time()
+    df = pd.read_csv("data/movies.csv", engine="pyarrow")
+    print(f"Loaded movies in {time.time() - start_time:.2f} seconds")
+    return df
 
-def load_movies(): 
-    return pd.read_csv("data/movies.csv", engine="pyarrow")
 
 def load_tags():
     start_time = time.time()
@@ -21,39 +24,157 @@ def load_tags():
     print(f"Loaded tags in {time.time() - start_time:.2f} seconds")
     return df
 
-#endregion
-
-
-
-# ==========================================
-# 2. DATA CLEANING PIPELINE
-# ==========================================
-
-# This method removes noisy data (bots, inactive users) to make the model more robust.
 def apply_data_cleaning(ratings, min_ratings=5, max_ratings_per_day=500):
-    print("\n[+] Applying Preprocessing Pipeline (Cleaning Data)...")
-    
-    # Remove bots or scrapers (users rating hundreds of movies in a single day)
-    user_counts = ratings['userId'].value_counts()
-    ratings = ratings[~ratings['userId'].isin(user_counts[user_counts > max_ratings_per_day].index)]
+    print("\n" + "=" * 65)
+    print("DATA CLEANING SUMMARY")
+    print("=" * 65)
 
-    # Remove users who give the exact same rating to every movie (Standard Deviation = 0)
-    user_std = ratings.groupby('userId')['rating'].std()
-    ratings = ratings[~ratings['userId'].isin(user_std[user_std == 0].index)]
+    ratings = ratings.copy()
+    original_count = len(ratings)
 
-    # Remove inactive users who haven't rated enough movies to establish a preference
-    active_users = user_counts[user_counts >= min_ratings].index
-    ratings = ratings[ratings['userId'].isin(active_users)]
+    print(f"Initial records: {original_count:,}")
+
+    cleaning_summary = []
+
+    # Helper function to track cleaning results
+    def log_cleaning(step, before, after):
+        removed = before - after
+        percentage = (removed / before * 100) if before > 0 else 0
+
+        cleaning_summary.append({
+            "Cleaning Operation": step,
+            "Records Removed": removed,
+            "Records Remaining": after,
+            "Percentage Removed": round(percentage, 2)
+        })
+
+        print(f"\n{step}")
+        print(f"  Records removed   : {removed:,}")
+        print(f"  Records remaining : {after:,}")
+        print(f"  Percentage removed: {percentage:.2f}%")
     
-    # Remove unpopular movies that don't have enough ratings to be recommended reliably
+    # --------------------------------------------------
+    # 1. DETECT SUSPICIOUS USERS
+    # Combines rapid rating velocity and zero rating variance
+    # --------------------------------------------------
+    before = len(ratings)
+
+    max_rating_interval = 1       # Seconds
+    min_rapid_percentage = 0.80   # At least 80%
+    min_rapid_intervals = 3       # Minimum number of rapid intervals
+
+    # Sort ratings chronologically for each user
+    ratings = ratings.sort_values(
+        ['userId', 'timestamp']
+    ).copy()
+
+    # Calculate time difference between consecutive ratings
+    ratings['time_difference'] = (
+        ratings.groupby('userId')['timestamp'].diff()
+    )
+
+    # Calculate rating interval statistics for each user
+    user_intervals = ratings.groupby('userId').agg(
+        total_intervals=('time_difference', 'count'),
+        rapid_intervals=(
+            'time_difference',
+            lambda x: (x <= max_rating_interval).sum()
+        ),
+        rating_std=('rating', 'std')
+    )
+
+    # Calculate percentage of rapid consecutive ratings
+    user_intervals['rapid_percentage'] = (
+        user_intervals['rapid_intervals'] /
+        user_intervals['total_intervals']
+    )
+
+    # Identify users satisfying ALL suspicious behaviour conditions
+    suspicious_users = user_intervals[
+        (user_intervals['rapid_intervals'] >= min_rapid_intervals) &
+        (user_intervals['rapid_percentage'] >= min_rapid_percentage) &
+        (user_intervals['rating_std'].fillna(0) == 0)
+    ].index
+
+    print("\n[3] Suspicious Users (Rapid Ratings + Constant Ratings)")
+    print(f"  Maximum rating interval : {max_rating_interval} second(s)")
+    print(f"  Minimum rapid percentage: {min_rapid_percentage * 100:.0f}%")
+    print(f"  Minimum rapid intervals : {min_rapid_intervals}")
+    print(f"  Zero rating variance    : Required")
+    print(f"  Users identified        : {len(suspicious_users):,}")
+
+    # Remove suspicious users
+    ratings = ratings[
+        ~ratings['userId'].isin(suspicious_users)
+    ].copy()
+
+    ratings = ratings.drop(columns=['time_difference'])
+
+    log_cleaning("Suspicious Users", before, len(ratings))
+
+
+    # --------------------------------------------------
+    # 6. REMOVE UNPOPULAR MOVIES
+    # Fewer than 5 ratings
+    # --------------------------------------------------
+    before = len(ratings)
+
     movie_counts = ratings['movieId'].value_counts()
-    ratings = ratings[ratings['movieId'].isin(movie_counts[movie_counts >= min_ratings].index)]
 
-    # Normalize the ratings by subtracting the user's average rating
-    # This helps adjust for "harsh" vs "generous" reviewers
-    user_means = ratings.groupby('userId')['rating'].transform('mean')
-    ratings['rating_normalized'] = ratings['rating'] - user_means
+    unpopular_movies = movie_counts[
+        movie_counts < min_ratings
+    ].index
+
+    print("\n[6] Unpopular Movies")
+    print(f"  Movies identified: {len(unpopular_movies):,}")
+
+    ratings = ratings[
+        ratings['movieId'].isin(
+            movie_counts[movie_counts >= min_ratings].index
+        )
+    ].copy()
+
+    log_cleaning("Unpopular Movies", before, len(ratings))
+
+    # --------------------------------------------------
+    # 8. FINAL SUMMARY
+    # --------------------------------------------------
+    final_count = len(ratings)
+    total_removed = original_count - final_count
+
+    print("\n" + "=" * 65)
+    print("FINAL DATA CLEANING RESULTS")
+    print("=" * 65)
+
+    print(f"Original records : {original_count:,}")
+    print(f"Final records    : {final_count:,}")
+    print(f"Total removed    : {total_removed:,}")
+
+    retention_rate = 0
+    if original_count > 0:
+        retention_rate = final_count / original_count * 100
+        
+    print(f"Retention rate   : {retention_rate:.2f}%")
+
+    print("\nDetailed Cleaning Breakdown:")
+    print(pd.DataFrame(cleaning_summary).to_string(index=False))
+
+    print("=" * 65)
     
+    # --------------------------------------------------
+    # 9. SAVE CLEANED DATASET
+    # --------------------------------------------------
+    os.makedirs('data', exist_ok=True)
+
+    output_path = 'data/cleaned_ratings.csv'
+
+    ratings.to_csv(output_path, index=False)
+
+    print("\n[+] Cleaned dataset saved successfully!")
+    print(f"    File location : {output_path}")
+    print(f"    Total records : {len(ratings):,}")
+    print(f"    Total columns : {len(ratings.columns)}")
+
     return ratings
 
 
