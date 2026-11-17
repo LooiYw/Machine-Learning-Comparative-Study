@@ -4,6 +4,7 @@ import os
 import time as time
 from sklearn.model_selection import train_test_split
 
+#region Load Dataset
 def load_ratings():
     start_time = time.time()
     df = pd.read_csv("data/ratings.csv", engine="pyarrow")
@@ -23,6 +24,7 @@ def load_tags():
     df = pd.read_csv("data/tags.csv", engine="pyarrow")
     print(f"Loaded tags in {time.time() - start_time:.2f} seconds")
     return df
+#endregion 
 
 def apply_data_cleaning(ratings, min_ratings=5, max_ratings_per_day=500):
     print("\n" + "=" * 65)
