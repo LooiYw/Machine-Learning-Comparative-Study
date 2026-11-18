@@ -298,6 +298,20 @@ def main():
 
     build_preprocessed_dataset(ratings, movies, users)
     build_scaled_dataset(ratings, movies, users)
+    
+        # ---- sanity check: reload each saved file and show the first 5 rows ----
+    pd.set_option('display.max_columns', 12)
+    pd.set_option('display.width', 200)
+
+    print("\n" + "=" * 60)
+    print("CHECK: ratings_preprocessed.parquet (first 5 rows)")
+    print("=" * 60)
+    print(load_ratings_preprocessed().head(5))
+
+    print("\n" + "=" * 60)
+    print("CHECK: ratings_scaled.parquet (first 5 rows)")
+    print("=" * 60)
+    print(load_ratings_scaled().head(5))
 
 
 if __name__ == "__main__":
