@@ -1,0 +1,4 @@
+# Ignore saved machine learning models
+saved_models/
+*.pkl
+*.joblib
