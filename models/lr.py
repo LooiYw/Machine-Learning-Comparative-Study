@@ -1,85 +1,59 @@
 import time
 import tracemalloc
-import numpy as np
-import pandas as pd
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
+from utils import evaluate, get_splits, save_results
 from preprocessing import load_ratings_preprocessed, load_ratings_scaled
 
-# Baseline parameters (Ref: Sharma, 2023, JATIT; IJCRT, 2026)
+# Baseline parameters (Ref: Sharma & Dutta, 2023, JATIT; Jahnavi & Shivam, 2026, IJCRT)
 BASELINE_PARAMS = {
-    'alpha': 1.0,           # L2 regularization strength (tunable: e.g., 0.01, 0.1, 1.0, 10.0)
+    'alpha': 1.0,
     'fit_intercept': True,
     'solver': 'auto',
     'random_state': 42,
 }
 
-DROP_COLS = ['userId', 'movieId', 'rating', 'split']
 
-
-def prepare_splits(df, eval_split='test'):
-    train_df = df[df['split'] == 'train']
-    eval_df = df[df['split'] == eval_split].copy()
-
-    X_train = train_df.drop(columns=DROP_COLS)
-    y_train = train_df['rating'].to_numpy()
-    X_eval = eval_df.drop(columns=DROP_COLS)
-    y_eval = eval_df['rating'].to_numpy()
-
-    # Impute NaNs (cold-start users/movies unseen in train) using train means only
-    imputer = SimpleImputer(strategy='mean')
-    X_train = imputer.fit_transform(X_train)
-    X_eval = imputer.transform(X_eval)
-
-    return X_train, y_train, X_eval, y_eval, eval_df[['userId', 'movieId', 'rating']]
-
-
-def compute_ranking_metrics(eval_meta, y_pred, k=20, threshold=4.0):
-    df = eval_meta.copy()
-    df['pred'] = y_pred
-    precisions, recalls = [], []
-
-    for _, group in df.groupby('userId'):
-        relevant = group[group['rating'] >= threshold]
-        if len(relevant) == 0:
-            continue
-        top_k = group.nlargest(k, 'pred')
-        hits = (top_k['rating'] >= threshold).sum()
-        precisions.append(hits / min(k, len(group)))
-        recalls.append(hits / len(relevant))
-
-    return float(np.mean(precisions)), float(np.mean(recalls))
-
-
-def run_lr(df, dataset_label, params=None, eval_split='test'):
+def run_lr(df=None, dataset_label=None, params=None):
+    if df is None:
+        run_lr(load_ratings_preprocessed(), "preprocessed", params=params)
+        run_lr(load_ratings_scaled(), "scaled", params=params)
+        return
     params = params or BASELINE_PARAMS
-    X_train, y_train, X_eval, y_eval, eval_meta = prepare_splits(df, eval_split)
+    splits, meta = get_splits(df)
+
+    # Impute cold-start NaNs using train means only (prevents data leakage)
+    imputer = SimpleImputer(strategy='mean')
+    X_train, y_train = splits['train']
+    X_train = imputer.fit_transform(X_train)
+    X_val, y_val = imputer.transform(splits['val'][0]), splits['val'][1]
+    X_test, y_test = imputer.transform(splits['test'][0]), splits['test'][1]
 
     model = Ridge(**params)
 
+    print(f"\n=== LR ({dataset_label}) ===")
     tracemalloc.start()
     t0 = time.time()
     model.fit(X_train, y_train)
     train_time = time.time() - t0
     _, peak_mem = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+    train_mem_mb = peak_mem / 1e6
+    print(f"  Trained in {train_time:.2f}s | Peak Train Mem: {train_mem_mb:.2f}MB")
 
-    t1 = time.time()
-    y_pred = np.clip(model.predict(X_eval), 1.0, 5.0)
-    pred_time = time.time() - t1
+    rows = []
+    for split_name, (X, y) in [('train', (X_train, y_train)), ('val', (X_val, y_val)), ('test', (X_test, y_test))]:
+        res = evaluate(split_name, model, X, y, meta[split_name])
+        res['model'] = f"LR_{dataset_label}"
+        res['train_time_s'] = train_time
+        res['train_mem_mb'] = train_mem_mb
+        rows.append(res)
 
-    rmse = root_mean_squared_error(y_eval, y_pred)
-    mae = mean_absolute_error(y_eval, y_pred)
-    p20, r20 = compute_ranking_metrics(eval_meta, y_pred, k=20)
-
-    print(f"\n--- Ridge/Linear Regression ({dataset_label} | {eval_split}) ---")
-    print(f"RMSE: {rmse:.4f} | MAE: {mae:.4f} | P@20: {p20:.4f} | R@20: {r20:.4f}")
-    print(f"Train: {train_time:.2f}s | Predict: {pred_time:.4f}s | Peak Mem: {peak_mem / 1e6:.2f} MB")
-    return model, {'rmse': rmse, 'mae': mae, 'p20': p20, 'r20': r20, 'train_time': train_time, 'pred_time': pred_time, 'peak_mem_mb': peak_mem / 1e6}
+    save_results(rows, params)
+    return model, rows
 
 
 if __name__ == "__main__":
-    run_lr(load_ratings_preprocessed(), "Preprocessed (Unscaled)")
-    run_lr(load_ratings_scaled(), "Scaled")
+    run_lr(load_ratings_preprocessed(), "preprocessed")
+    run_lr(load_ratings_scaled(), "scaled")
