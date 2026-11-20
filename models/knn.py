@@ -1,30 +1,97 @@
+# KNN regressor (ready for hyperparameter tuning)
+# Data comes from preprocessing.py:
+#   load_ratings_preprocessed() -> no feature scaling
+#   load_ratings_scaled()       -> with feature scaling
+# To tune later: pass new values to build_model(params), or use GridSearchCV with the step name, e.g. {'knn__n_neighbors': [10, 20, 30]}
+
+import gc
+import json
+import os
 import time
+import tracemalloc
+import numpy as np
+import pandas as pd
+from sklearn.impute import SimpleImputer
 from sklearn.neighbors import KNeighborsRegressor
-from preprocessing import prepare_raw_features, prepare_cleaned_features
-from shared_pipeline import evaluate_model
+from sklearn.pipeline import Pipeline
+from preprocessing import load_ratings_preprocessed, load_ratings_scaled
+from utils import get_splits, evaluate, save_results
 
-def run_knn():
-    # 1. RAW DATA
-    print("\n=== MODEL: KNN (RAW CORRUPTED DATA) ===")
-    X_train, X_test, y_train, y_test, test_df = prepare_raw_features()
-    model = KNeighborsRegressor(n_neighbors=20, n_jobs=-1)  # Fully Parallel
-    
-    start_time = time.time()
-    print("Training KNN (Raw)...")
-    model.fit(X_train, y_train)
-    end_time = time.time() - start_time
-    evaluate_model("KNN_CORRUPTED", model, X_test, y_test, test_df, end_time, k=20)
+# Values are sklearn defaults unless marked "original"
+BASELINE_PARAMS = dict(
+    n_neighbors=20,      # original value (sklearn default is 5)
+    weights='uniform',
+    algorithm='auto',
+    leaf_size=30,
+    p=2,                 # Euclidean distance
+    metric='minkowski',
+    n_jobs=-1,           # use all CPU cores
+)
 
-    # 2. CLEANED DATA
-    print("\n=== MODEL: KNN (CLEANED ROBUST DATA) ===")
-    X_train, X_test, y_train, y_test, test_df = prepare_cleaned_features()
-    model = KNeighborsRegressor(n_neighbors=20, n_jobs=-1)  # Fully Parallel
-    
-    start_time = time.time()
-    print("Training KNN (Cleaned)...")
-    model.fit(X_train, y_train)
-    end_time = time.time() - start_time
-    evaluate_model("KNN_CLEANED", model, X_test, y_test, test_df, end_time, k=20)
+# Columns that are NOT used as model inputs
+NON_FEATURE_COLS = ['userId', 'movieId', 'rating', 'split']
+
+# Results file
+RESULTS_FILE = os.path.join('results', 'model_evaluation_results.csv')
+
+# The two datasets we compare: (name, loader function)
+DATASETS = [
+    ('KNN_PREPROCESSED', load_ratings_preprocessed),
+    ('KNN_SCALED', load_ratings_scaled),
+]
+
+
+# Build the model: fill missing values first, then KNN (params overrides the baseline)
+def build_model(params=None):
+    merged = {**BASELINE_PARAMS, **(params or {})}
+    return Pipeline([
+        # users/movies not seen in train have missing stats, so fill them with the mean
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('knn', KNeighborsRegressor(**merged)),
+    ])
+
+
+# Train and test KNN on both datasets, then save the results
+def run_knn(params=None):
+    results = []
+    for label, loader in DATASETS:
+        print(f"\n=== MODEL: {label} ===")
+        df = loader()
+        
+        # 2. UNPACK SPLITS AND META
+        splits, meta = get_splits(df)
+        del df               
+        gc.collect()
+
+        X_train, y_train = splits['train']
+        model = build_model(params)
+
+        print(f"Training {label}...")
+        
+        # 3. TRACK MEMORY AND TIME DURING TRAINING
+        tracemalloc.start()
+        start = time.time()
+        model.fit(X_train, y_train)
+        train_time = time.time() - start
+        _, peak_mem = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        train_mem_mb = peak_mem / 1e6
+        
+        print(f"  train time: {train_time:.2f}s | train memory: {train_mem_mb:.2f}MB")
+
+        for name in ('val', 'test'):
+            X, y = splits[name]
+            
+            # 4. GET META FOR THE SPLIT AND PASS TO EVALUATE
+            eval_meta = meta[name]
+            res = evaluate(name, model, X, y, eval_meta)
+            
+            # 5. ADD TRAIN_MEM_MB TO RESULTS
+            res.update(model=label, train_time_s=train_time, train_mem_mb=train_mem_mb)
+            results.append(res)
+
+        save_results(results[-2:], {**BASELINE_PARAMS, **(params or {})})
+    return results
 
 if __name__ == "__main__":
     run_knn()
