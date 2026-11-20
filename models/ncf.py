@@ -1,27 +1,28 @@
 """
 Neural Collaborative Filtering (NeuMF) for rating prediction on MovieLens 1M.
 
-Reads data/processed/ratings_scaled.parquet (built by preprocess_ml1m.py), trains
-on the 'train' rows, picks the best epoch on the 'val' rows, and reports RMSE / MAE
-on train, val and test. Results are written to model_evaluation_results.csv.
+Reads data/processed/ratings_scaled.parquet (built by preprocessing.py), trains
+on the 'train' rows, picks the best epoch on the 'val' rows, then evaluates
+train / val / test with utils.evaluate (RMSE, MAE, R2, accuracy, P/R/F1@20,
+time, memory) and appends the rows to results/model_evaluation_results.csv
+via utils.save_results.
 
-Two variants are trained and compared:
-  - NCF (IDs only)         : classic NeuMF, user and movie embeddings only
-  - NCF (IDs + side feats) : same, plus the scaled user / movie features fed into the MLP
+Model: NeuMF with user / movie embeddings, plus scaled user / movie side
+features fed into the MLP branch.
 
-Requires: torch, numpy, pandas, pyarrow
+Requires: torch, numpy, pandas, pyarrow, scikit-learn
 """
 import copy
 import time
+import tracemalloc
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 
-from preprocessing import load_ratings_scaled
-
-RESULTS_PATH = 'model_evaluation_results.csv'
+from preprocessing import load_ratings_scaled, load_ratings_preprocessed
+from utils import NON_FEATURE_COLS, evaluate, save_results
 
 SEED = 42
 EMBED_DIM = 32
@@ -31,14 +32,10 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
 BATCH_SIZE = 1024
 MAX_EPOCHS = 30
-PATIENCE = 3                    # stop after this many epochs without val RMSE gain
+PATIENCE = 3
 RATING_MIN, RATING_MAX = 1.0, 5.0
 
-# Columns that are not model inputs. user_avg / movie_avg are excluded from the
-# side features because, on train rows, they include the row's own rating
-# (target leakage), which makes the model look great in training and worse on
-# val/test.
-NON_FEATURE_COLS = ['userId', 'movieId', 'rating', 'split']
+# user_avg / movie_avg include the row's own rating on train rows (leakage)
 LEAKY_COLS = ['user_avg', 'movie_avg']
 
 
@@ -54,21 +51,19 @@ def set_seed(seed=SEED):
 # =====================================================================
 
 def prepare_data(df, device):
-    """Maps ids to contiguous indices and builds tensors for each split."""
+    """Maps ids to contiguous indices; builds tensors and eval metadata per split."""
     user_index = {u: i for i, u in enumerate(np.sort(df['userId'].unique()))}
     movie_index = {m: i for i, m in enumerate(np.sort(df['movieId'].unique()))}
 
     feature_cols = [c for c in df.columns
                     if c not in NON_FEATURE_COLS and c not in LEAKY_COLS]
-    # NaN only appears for movies unseen in train (movie_popularity); 0 is the
-    # scaled mean, so it reads as "average".
     features = df[feature_cols].fillna(0).to_numpy(dtype=np.float32)
 
     users = df['userId'].map(user_index).to_numpy(dtype=np.int64)
     movies = df['movieId'].map(movie_index).to_numpy(dtype=np.int64)
     ratings = df['rating'].to_numpy(dtype=np.float32)
 
-    splits = {}
+    splits, meta = {}, {}
     for name in ('train', 'val', 'test'):
         mask = (df['split'] == name).to_numpy()
         splits[name] = {
@@ -77,6 +72,8 @@ def prepare_data(df, device):
             'features': torch.from_numpy(features[mask]).to(device),
             'rating': torch.from_numpy(ratings[mask]).to(device),
         }
+        # same row order as the tensors; used by utils for Top-K ranking metrics
+        meta[name] = df.loc[mask, ['userId', 'movieId', 'rating']].copy()
 
     info = {
         'n_users': len(user_index),
@@ -87,7 +84,7 @@ def prepare_data(df, device):
     print(f"Users: {info['n_users']:,} | Movies: {info['n_movies']:,} | "
           f"Side features: {info['n_features']}")
     print({k: len(v['rating']) for k, v in splits.items()})
-    return splits, info
+    return splits, meta, info
 
 
 # =====================================================================
@@ -114,7 +111,6 @@ class NCF(nn.Module):
         self.mlp = nn.Sequential(*layers)
 
         self.head = nn.Linear(embed_dim + mlp_layers[-1], 1)
-        # start predicting the global mean instead of 0
         nn.init.constant_(self.head.bias, global_mean)
 
         for emb in (self.user_gmf, self.movie_gmf, self.user_mlp, self.movie_mlp):
@@ -122,37 +118,61 @@ class NCF(nn.Module):
 
     def forward(self, user, movie, features=None):
         gmf = self.user_gmf(user) * self.movie_gmf(movie)
-
         mlp_in = [self.user_mlp(user), self.movie_mlp(movie)]
         if self.n_features > 0:
             mlp_in.append(features)
         mlp = self.mlp(torch.cat(mlp_in, dim=1))
-
         return self.head(torch.cat([gmf, mlp], dim=1)).squeeze(1)
 
 
 # =====================================================================
-# Train / evaluate
+# Bridge to utils.evaluate
 # =====================================================================
 
-@torch.no_grad()
-def predict(model, data, use_features, batch_size=8192):
-    model.eval()
-    preds = []
-    n = len(data['rating'])
-    for start in range(0, n, batch_size):
-        sl = slice(start, start + batch_size)
-        feats = data['features'][sl] if use_features else None
-        preds.append(model(data['user'][sl], data['movie'][sl], feats))
-    return torch.cat(preds).clamp(RATING_MIN, RATING_MAX)
+class NCFPredictor:
+    """
+    Gives the torch model the sklearn-style .predict(X) that utils.evaluate expects.
+    X is just the row positions (np.arange(n)) within one split, because the NCF
+    needs user / movie ids and side features that live in the split's tensors.
+    """
+
+    def __init__(self, model, data, use_features, batch_size=8192):
+        self.model, self.data = model, data
+        self.use_features, self.batch_size = use_features, batch_size
+
+    @torch.no_grad()
+    def predict(self, X):
+        self.model.eval()
+        idx_all = torch.as_tensor(np.asarray(X).ravel(), dtype=torch.long,
+                                  device=self.data['user'].device)
+        out = []
+        for s in range(0, len(idx_all), self.batch_size):
+            idx = idx_all[s:s + self.batch_size]
+            feats = self.data['features'][idx] if self.use_features else None
+            out.append(self.model(self.data['user'][idx], self.data['movie'][idx], feats))
+        return torch.cat(out).clamp(RATING_MIN, RATING_MAX).cpu().numpy()
 
 
-def rmse_mae(pred, target):
-    err = pred - target
-    return float(torch.sqrt((err ** 2).mean())), float(err.abs().mean())
+def evaluate_all_splits(label, model_factory, splits, meta, train_stats):
+    """Runs utils.evaluate on train/val/test and attaches the training cost columns."""
+    rows = []
+    for split_name in ('train', 'val', 'test'):
+        n = len(splits[split_name]['rating'])
+        X = np.arange(n)
+        y = splits[split_name]['rating'].cpu().numpy()
+        res = evaluate(split_name, model_factory(split_name), X, y, meta[split_name])
+        res['model'] = label
+        res.update(train_stats)
+        rows.append(res)
+    return rows
 
 
-def train_and_evaluate(name, splits, info, use_features, device):
+# =====================================================================
+# Train
+# =====================================================================
+
+def train_ncf(splits, info, use_features, device):
+    """Trains with early stopping on val RMSE. Returns (best model, stats dict, params dict)."""
     set_seed()
     model = NCF(
         info['n_users'], info['n_movies'],
@@ -164,14 +184,19 @@ def train_and_evaluate(name, splits, info, use_features, device):
                                  weight_decay=WEIGHT_DECAY)
     loss_fn = nn.MSELoss()
 
-    train = splits['train']
+    train, val = splits['train'], splits['val']
     n_train = len(train['rating'])
+    val_pred_model = NCFPredictor(model, val, use_features)
 
-    print(f"\n{'=' * 60}\nTraining: {name}  ({n_params:,} parameters, device={device})\n{'=' * 60}")
+    on_cuda = device.type == 'cuda'
+    if on_cuda:
+        torch.cuda.reset_peak_memory_stats()
+    else:
+        tracemalloc.start()
     start_time = time.time()
+
     best = {'rmse': float('inf'), 'state': None, 'epoch': 0}
-    stale = 0
-    epochs_run = 0
+    stale, epochs_run = 0, 0
 
     for epoch in range(1, MAX_EPOCHS + 1):
         model.train()
@@ -191,10 +216,9 @@ def train_and_evaluate(name, splits, info, use_features, device):
 
         epochs_run = epoch
         train_rmse = (running_loss / n_train) ** 0.5
-        val_rmse, val_mae = rmse_mae(predict(model, splits['val'], use_features),
-                                     splits['val']['rating'])
-        print(f"Epoch {epoch:02d} | train RMSE {train_rmse:.4f} | "
-              f"val RMSE {val_rmse:.4f} | val MAE {val_mae:.4f}")
+        val_p = torch.from_numpy(val_pred_model.predict(np.arange(len(val['rating'])))).to(device)
+        val_rmse = float(torch.sqrt(((val_p - val['rating']) ** 2).mean()))
+        print(f"Epoch {epoch:02d} | train RMSE {train_rmse:.4f} | val RMSE {val_rmse:.4f}")
 
         if val_rmse < best['rmse'] - 1e-4:
             best.update(rmse=val_rmse, state=copy.deepcopy(model.state_dict()), epoch=epoch)
@@ -206,35 +230,24 @@ def train_and_evaluate(name, splits, info, use_features, device):
                 break
 
     train_seconds = time.time() - start_time
+    if on_cuda:
+        peak_mb = torch.cuda.max_memory_allocated() / 1e6
+    else:
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        peak_mb = peak / 1e6   # Python-heap only; torch tensors are not tracked on CPU
+
     model.load_state_dict(best['state'])
     print(f"Best epoch: {best['epoch']} (val RMSE {best['rmse']:.4f})")
 
-    rows = []
-    for split_name in ('train', 'val', 'test'):
-        rmse, mae = rmse_mae(predict(model, splits[split_name], use_features),
-                             splits[split_name]['rating'])
-        rows.append({
-            'model': name, 'split': split_name,
-            'rmse': round(rmse, 4), 'mae': round(mae, 4),
-            'best_epoch': best['epoch'], 'epochs_run': epochs_run,
-            'parameters': n_params, 'train_seconds': round(train_seconds, 1),
-        })
-        print(f"{split_name:<5} RMSE {rmse:.4f} | MAE {mae:.4f}")
-    return rows
-
-
-def baseline_rows(splits, info):
-    """Predict the train-set mean for everything, as a reference point."""
-    rows = []
-    for split_name in ('train', 'val', 'test'):
-        target = splits[split_name]['rating']
-        pred = torch.full_like(target, info['global_mean'])
-        rmse, mae = rmse_mae(pred, target)
-        rows.append({'model': 'Global mean baseline', 'split': split_name,
-                     'rmse': round(rmse, 4), 'mae': round(mae, 4),
-                     'best_epoch': 0, 'epochs_run': 0, 'parameters': 0,
-                     'train_seconds': 0.0})
-    return rows
+    stats = {'train_time_s': train_seconds, 'train_mem_mb': peak_mb}
+    params = {
+        'embed_dim': EMBED_DIM, 'mlp_layers': MLP_LAYERS, 'dropout': DROPOUT,
+        'lr': LEARNING_RATE, 'weight_decay': WEIGHT_DECAY, 'batch_size': BATCH_SIZE,
+        'best_epoch': best['epoch'], 'epochs_run': epochs_run,
+        'n_parameters': n_params, 'use_side_features': use_features,
+    }
+    return model, stats, params
 
 
 # =====================================================================
@@ -245,20 +258,19 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    df = load_ratings_scaled()
-    splits, info = prepare_data(df, device)
+    df = load_ratings_preprocessed() #change this to preprocessed to get the preprocessed data or scaled 
+    splits, meta, info = prepare_data(df, device)
     del df
 
-    results = baseline_rows(splits, info)
-    results += train_and_evaluate('NCF (IDs only)', splits, info,
-                                  use_features=False, device=device)
-    results += train_and_evaluate('NCF (IDs + side features)', splits, info,
-                                  use_features=True, device=device)
+    label = 'NCF_scaled' #also update this as well
+    print(f"\n{'=' * 60}\nTraining: {label}\n{'=' * 60}")
+    model, stats, params = train_ncf(splits, info, True, device)
+    rows = evaluate_all_splits(
+        label, lambda s: NCFPredictor(model, splits[s], True),
+        splits, meta, stats)
+    save_results(rows, params)
 
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(RESULTS_PATH, index=False)
-    print(f"\nSaved: {RESULTS_PATH}")
-    print(results_df.to_string(index=False))
+    print("\nResults appended to results/model_evaluation_results.csv")
 
 
 if __name__ == "__main__":

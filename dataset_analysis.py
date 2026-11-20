@@ -345,14 +345,14 @@ def inspect_dataset(dataframe, file_name):
 # ----------------------------------------------------------------------
 def main():
     ratings = load_ratings_raw()
-    movies = load_movies()
-    users = load_users()
+    # movies = load_movies()
+    # users = load_users()
 
-    dataset_overview(ratings, movies, users)                                    # A
-    ratings_per_user, ratings_per_movie = data_distribution(ratings)            # B
-    outlier_detection(ratings_per_user, ratings_per_movie)                      # C
-    data_quality(ratings, movies, users, ratings_per_user, ratings_per_movie)   # D
-    feature_scaling(ratings, movies, users, ratings_per_user, ratings_per_movie)  # E
+    # dataset_overview(ratings, movies, users)                                    # A
+    # ratings_per_user, ratings_per_movie = data_distribution(ratings)            # B
+    # outlier_detection(ratings_per_user, ratings_per_movie)                      # C
+    # data_quality(ratings, movies, users, ratings_per_user, ratings_per_movie)   # D
+    # feature_scaling(ratings, movies, users, ratings_per_user, ratings_per_movie)  # E
 
 
 if __name__ == "__main__":
