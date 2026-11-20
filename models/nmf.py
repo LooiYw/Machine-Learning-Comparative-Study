@@ -1,12 +1,3 @@
-# NMF + Ridge regression (ready for hyperparameter tuning)
-# Data comes from preprocessing.py:
-#   load_ratings_preprocessed() -> no feature scaling
-#   load_ratings_scaled()       -> with feature scaling
-# Idea: NMF shrinks the features into a few components, then Ridge predicts the rating.
-# NMF only accepts numbers >= 0. The scaled data has negative numbers, so for the scaled dataset only, a MinMaxScaler is added to move everything into 0-1.
-# To tune later: pass new values to build_model(), or use GridSearchCV with the step names
-# e.g. {'nmf__n_components': [10, 20, 30], 'ridge__alpha': [0.1, 1, 10]}
-
 import gc
 import json
 import os
@@ -96,21 +87,23 @@ def run_nmf(nmf_params=None, ridge_params=None):
         tracemalloc.stop()
         train_mem_mb = peak_mem / 1e6
         
-        print(f"  train time: {train_time:.2f}s | train memory: {train_mem_mb:.2f}MB")
+        print(f"  Train Time: {train_time:.2f}s | Train Memory: {train_mem_mb:.2f}MB")
 
-        for name in ('val', 'test'):
+        for name in ('train', 'val', 'test'):
             X, y = splits[name]
+
+            # 4. GET META FOR THE SPLIT AND PASS TO EVALUATE
             eval_meta = meta[name]
-            
-            # Pass eval_meta to evaluate
             res = evaluate(name, model, X, y, eval_meta)
+            
+            # 5. ADD TRAIN_MEM_MB TO RESULTS
             res.update(model=label, train_time_s=train_time, train_mem_mb=train_mem_mb)
             results.append(res)
 
         # Save both parameter dictionaries
         used = {'nmf': {**NMF_BASELINE, **(nmf_params or {})},
                 'ridge': {**RIDGE_BASELINE, **(ridge_params or {})}}
-        save_results(results[-2:], used)
+        save_results(results[-3:], used)
     return results
 
 if __name__ == "__main__":
