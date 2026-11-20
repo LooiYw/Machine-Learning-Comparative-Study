@@ -1,11 +1,14 @@
 """
 Neural Collaborative Filtering (NeuMF) for rating prediction on MovieLens 1M.
 
-Reads data/processed/ratings_scaled.parquet (built by preprocessing.py), trains
-on the 'train' rows, picks the best epoch on the 'val' rows, then evaluates
-train / val / test with utils.evaluate_nn (RMSE, MAE, R2, accuracy, P/R/F1@20,
-time, memory) and appends the rows to results/model_evaluation_results.csv
-via utils.save_results.
+Reads data/processed/ratings_*.parquet (built by preprocessing.py), trains on the
+'train' rows, picks the best epoch on the 'val' rows, then evaluates train / val /
+test with utils.evaluate_nn (RMSE, MAE, R2, accuracy, P/R/F1@20, time, memory) and
+appends the rows to results/model_evaluation_results.csv via utils.save_results.
+
+This file also holds the shared neural-network pipeline (data preparation, generic
+trainer, predictor bridge, dataset loop) that c_nge.py and nmetricf.py reuse, so all
+three models are trained and measured in exactly the same way.
 
 Model: NeuMF with user / movie embeddings, plus scaled user / movie side
 features fed into the MLP branch.
@@ -13,6 +16,7 @@ features fed into the MLP branch.
 Requires: torch, numpy, pandas, pyarrow, scikit-learn, psutil
 """
 import copy
+import gc
 
 import numpy as np
 import pandas as pd
@@ -35,6 +39,17 @@ RATING_MIN, RATING_MAX = 1.0, 5.0
 
 # user_avg / movie_avg include the row's own rating on train rows (leakage)
 LEAKY_COLS = ['user_avg', 'movie_avg']
+
+# Side features that describe the USER (everything else describes the movie)
+USER_FEATURE_COLS = ('is_male', 'age', 'user_activity')
+USER_FEATURE_PREFIXES = ('occ_', 'zip_')
+
+# The two datasets we compare: (name, loader function), same as knn.py.
+# The label is split on the first '_' by save_results: Algorithm 'NCF', Dataset 'preprocessed'/'scaled'.
+DATASETS = [
+    ('NCF_PREPROCESSED', load_ratings_preprocessed),
+    ('NCF_SCALED', load_ratings_scaled),
+]
 
 
 def set_seed(seed=SEED):
@@ -77,12 +92,23 @@ def prepare_data(df, device):
         'n_users': len(user_index),
         'n_movies': len(movie_index),
         'n_features': len(feature_cols),
+        'feature_cols': feature_cols,
         'global_mean': float(ratings[(df['split'] == 'train').to_numpy()].mean()),
     }
     print(f"Users: {info['n_users']:,} | Movies: {info['n_movies']:,} | "
           f"Side features: {info['n_features']}")
     print({k: len(v['rating']) for k, v in splits.items()})
     return splits, meta, info
+
+
+def split_user_item_features(feature_cols):
+    """Column positions of the user-side and movie-side features within the feature matrix."""
+    user_idx = [i for i, c in enumerate(feature_cols)
+                if c in USER_FEATURE_COLS or c.startswith(USER_FEATURE_PREFIXES)]
+    user_set = set(user_idx)
+    item_idx = [i for i in range(len(feature_cols)) if i not in user_set]
+    print(f"User-side features: {len(user_idx)} | Movie-side features: {len(item_idx)}")
+    return user_idx, item_idx
 
 
 # =====================================================================
@@ -129,9 +155,10 @@ class NCF(nn.Module):
 
 class NCFPredictor:
     """
-    Gives the torch model the sklearn-style .predict(X) that utils.evaluate_nn expects.
-    X is just the row positions (np.arange(n)) within one split, because the NCF
-    needs user / movie ids and side features that live in the split's tensors.
+    Gives a torch model the sklearn-style .predict(X) that utils.evaluate_nn expects.
+    X is just the row positions (np.arange(n)) within one split, because the models
+    need user / movie ids and side features that live in the split's tensors.
+    Works for any model with forward(user, movie, features).
     """
 
     def __init__(self, model, data, use_features, batch_size=8192):
@@ -168,11 +195,15 @@ def evaluate_all_splits(label, model_factory, splits, meta, train_stats):
 
 
 # =====================================================================
-# Train
+# Train (generic: works for NCF, C-NGE, NMetricF, ...)
 # =====================================================================
 
-def train_ncf(splits, info, use_features, device):
-    """Trains with early stopping on val RMSE. Returns (best model, stats dict, params dict)."""
+def train_model(build_model, splits, info, device, use_features=True):
+    """
+    Trains with early stopping on val RMSE.
+    build_model() must return an nn.Module with forward(user, movie, features).
+    Returns (best model, stats dict, training-params dict).
+    """
     set_seed()
     train, val = splits['train'], splits['val']
     n_train = len(train['rating'])
@@ -183,11 +214,7 @@ def train_ncf(splits, info, use_features, device):
     # Time and memory cover everything training needs: model creation (weights),
     # optimizer state, every epoch and the per-epoch validation passes.
     with track_resources(device) as res:
-        model = NCF(
-            info['n_users'], info['n_movies'],
-            n_features=info['n_features'] if use_features else 0,
-            global_mean=info['global_mean'],
-        ).to(device)
+        model = build_model().to(device)
         n_params = sum(p.numel() for p in model.parameters())
         optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE,
                                      weight_decay=WEIGHT_DECAY)
@@ -232,7 +259,6 @@ def train_ncf(splits, info, use_features, device):
 
     stats = {'train_time_s': res['time_s'], 'train_mem_mb': res['mem_mb']}
     params = {
-        'embed_dim': EMBED_DIM, 'mlp_layers': MLP_LAYERS, 'dropout': DROPOUT,
         'lr': LEARNING_RATE, 'weight_decay': WEIGHT_DECAY, 'batch_size': BATCH_SIZE,
         'best_epoch': best['epoch'], 'epochs_run': epochs_run,
         'n_parameters': n_params, 'use_side_features': use_features,
@@ -241,26 +267,55 @@ def train_ncf(splits, info, use_features, device):
 
 
 # =====================================================================
+# Dataset loop (same flow as knn.py)
+# =====================================================================
+
+def run_datasets(datasets, make_builder, model_params, use_features=True):
+    """
+    For each (label, loader): load the data, train, evaluate train/val/test and save.
+    make_builder(info) returns the zero-argument function that builds a fresh model.
+    model_params is the model-specific hyper-parameter dict logged to the CSV.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    for label, loader in datasets:
+        print(f"\n{'=' * 60}\n=== MODEL: {label} ===\n{'=' * 60}")
+        df = loader()
+        splits, meta, info = prepare_data(df, device)
+        del df
+        gc.collect()
+
+        model, stats, train_params = train_model(
+            make_builder(info), splits, info, device, use_features)
+        rows = evaluate_all_splits(
+            label, lambda s: NCFPredictor(model, splits[s], use_features),
+            splits, meta, stats)
+        save_results(rows, {**model_params, **train_params})
+
+        # free memory before the next dataset so it doesn't skew its measurements
+        del model, splits, meta
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+    print("\nResults appended to results/model_evaluation_results.csv")
+
+
+# =====================================================================
 # Main
 # =====================================================================
 
 def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    def make_builder(info):
+        return lambda: NCF(
+            info['n_users'], info['n_movies'], n_features=info['n_features'],
+            global_mean=info['global_mean'])
 
-    df = load_ratings_scaled() #change this to preprocessed to get the preprocessed data or scaled 
-    splits, meta, info = prepare_data(df, device)
-    del df
-
-    label = 'NCF_scaled' #also update this as well
-    print(f"\n{'=' * 60}\nTraining: {label}\n{'=' * 60}")
-    model, stats, params = train_ncf(splits, info, True, device)
-    rows = evaluate_all_splits(
-        label, lambda s: NCFPredictor(model, splits[s], True),
-        splits, meta, stats)
-    save_results(rows, params)
-
-    print("\nResults appended to results/model_evaluation_results.csv")
+    run_datasets(
+        DATASETS, make_builder,
+        {'embed_dim': EMBED_DIM, 'mlp_layers': MLP_LAYERS, 'dropout': DROPOUT},
+        use_features=True)
 
 
 if __name__ == "__main__":
