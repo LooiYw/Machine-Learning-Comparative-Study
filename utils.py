@@ -2,7 +2,6 @@ import os
 import time
 import json
 import threading
-import tracemalloc
 from contextlib import contextmanager
 import numpy as np
 import pandas as pd
@@ -84,36 +83,36 @@ def _build_result(split_name, y, pred, eval_meta, predict_time, peak_mem_mb, tim
     
     return result
 
-# Predicts ratings, calculates all error/classification/ranking metrics, and measures memory
-# (for sklearn-style / pure Python models; tracemalloc only sees Python-heap allocations)
-def evaluate(split_name, model, X, y, eval_meta):
-    tracemalloc.start()
-    start = time.time()
-    
-    # Ensure predicted ratings stay within the valid 1 to 5 star range
-    pred = np.clip(model.predict(X), 1, 5)
-    
-    predict_time = time.time() - start
-    _, peak_mem = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    
-    return _build_result(split_name, y, pred, eval_meta, predict_time, peak_mem / 1e6)
+# Predicts ratings, calculates all error/classification/ranking metrics, and measures
+# time and memory with track_resources, the same method for every model (sklearn, numpy
+# and PyTorch alike). Pass device (a torch device) only for GPU models.
+def evaluate(split_name, model, X, y, eval_meta, device=None):
+    with track_resources(device) as res:
+        # Ensure predicted ratings stay within the valid 1 to 5 star range
+        pred = np.clip(model.predict(X), 1, 5)
+
+    return _build_result(split_name, y, pred, eval_meta,
+                         res['time_s'], res['mem_mb'], time_digits=4)
 
 
 # =====================================================================
-# Neural network time / memory measurement
+# Time / memory measurement (one method for ALL models)
 # =====================================================================
-# tracemalloc only tracks Python-heap allocations, so it misses almost all of
-# the memory a PyTorch model uses (tensors live in native CPU memory or on the
-# GPU). These helpers measure what actually matters:
+# tracemalloc only tracks Python-heap allocations, so it misses memory that
+# numpy / scikit-learn / PyTorch allocate natively. track_resources measures
+# what the process actually used, the same way for every model:
 #   - GPU : peak torch.cuda memory allocated during the block (with CUDA
 #           synchronisation so the timing is not just the kernel launch)
-#   - CPU : peak process memory (RSS) during the block, sampled by a
+#   - CPU : peak process memory (RSS) during the block, sampled every 5 ms by a
 #           background thread (needs psutil: pip install psutil)
 # Memory is reported as peak MINUS what was already allocated when the block
 # started, i.e. the extra memory the measured step needed. Data and models that
 # were loaded beforehand are not counted, so create the model inside the block
 # if you want its weights included (as ncf.py does for training).
+# Limitation (CPU): if the process already holds free memory pages from earlier
+# work, new allocations can reuse them and RSS barely moves, so small steps can
+# read lower than they truly are. Evaluate splits in the same order for every
+# model and run each dataset in its own process to keep runs comparable.
 
 @contextmanager
 def track_resources(device=None):
@@ -154,18 +153,8 @@ def track_resources(device=None):
         psutil = None
 
     if psutil is None:
-        print("WARNING: psutil not installed - CPU memory falls back to tracemalloc, which "
-              "does not see PyTorch tensors. Run 'pip install psutil' for accurate numbers.")
-        tracemalloc.start()
-        start = time.perf_counter()
-        try:
-            yield stats
-        finally:
-            stats['time_s'] = time.perf_counter() - start
-            _, peak = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
-            stats['mem_mb'] = peak / 1e6
-        return
+        # No silent fallback: mixing measurement methods would make models incomparable.
+        raise ImportError("track_resources needs psutil for CPU memory: pip install psutil")
 
     proc = psutil.Process(os.getpid())
     baseline = proc.memory_info().rss
@@ -190,15 +179,9 @@ def track_resources(device=None):
         stats['mem_mb'] = max(peak[0] - baseline, 0) / 1e6
 
 
-# Same metrics as evaluate(), but time and memory come from track_resources so they
-# are realistic for neural networks. device is the torch device the model runs on.
+# Kept so ncf.py keeps working; identical to evaluate(). device is the torch device.
 def evaluate_nn(split_name, model, X, y, eval_meta, device=None):
-    with track_resources(device) as res:
-        # Ensure predicted ratings stay within the valid 1 to 5 star range
-        pred = np.clip(model.predict(X), 1, 5)
-
-    return _build_result(split_name, y, pred, eval_meta,
-                         res['time_s'], res['mem_mb'], time_digits=4)
+    return evaluate(split_name, model, X, y, eval_meta, device=device)
 
 
 # Formats the evaluation metrics and appends them to the results CSV file
