@@ -1,7 +1,9 @@
 import os
 import time
 import json
+import threading
 import tracemalloc
+from contextlib import contextmanager
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, accuracy_score
@@ -48,18 +50,8 @@ def compute_ranking_metrics(eval_meta, y_pred, k=20, threshold=4.0):
     
     return p_k, r_k, f1_k
 
-# Predicts ratings, calculates all error/classification/ranking metrics, and measures memory
-def evaluate(split_name, model, X, y, eval_meta):
-    tracemalloc.start()
-    start = time.time()
-    
-    # Ensure predicted ratings stay within the valid 1 to 5 star range
-    pred = np.clip(model.predict(X), 1, 5)
-    
-    predict_time = time.time() - start
-    _, peak_mem = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    
+# Calculates all error/classification/ranking metrics from predictions and builds the result row
+def _build_result(split_name, y, pred, eval_meta, predict_time, peak_mem_mb, time_digits=2):
     # Error Metrics
     rmse = float(np.sqrt(mean_squared_error(y, pred)))
     mae = float(mean_absolute_error(y, pred))
@@ -81,8 +73,8 @@ def evaluate(split_name, model, X, y, eval_meta):
         'Precision@20': round(p20, 4),
         'Recall@20': round(r20, 4),
         'F1@20': round(f1_20, 4),
-        'Predict Time (s)': round(predict_time, 2),
-        'Predict Memory (MB)': round(peak_mem / 1e6, 2)
+        'Predict Time (s)': round(predict_time, time_digits),
+        'Predict Memory (MB)': round(peak_mem_mb, 2)
     }
     
     print(f"  [{split_name:<4}] RMSE={result['RMSE']} | MAE={result['MAE']} | R2={result['R2']} | "
@@ -91,6 +83,123 @@ def evaluate(split_name, model, X, y, eval_meta):
           f"Pred Time={result['Predict Time (s)']}s | Pred Mem={result['Predict Memory (MB)']}MB")
     
     return result
+
+# Predicts ratings, calculates all error/classification/ranking metrics, and measures memory
+# (for sklearn-style / pure Python models; tracemalloc only sees Python-heap allocations)
+def evaluate(split_name, model, X, y, eval_meta):
+    tracemalloc.start()
+    start = time.time()
+    
+    # Ensure predicted ratings stay within the valid 1 to 5 star range
+    pred = np.clip(model.predict(X), 1, 5)
+    
+    predict_time = time.time() - start
+    _, peak_mem = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    
+    return _build_result(split_name, y, pred, eval_meta, predict_time, peak_mem / 1e6)
+
+
+# =====================================================================
+# Neural network time / memory measurement
+# =====================================================================
+# tracemalloc only tracks Python-heap allocations, so it misses almost all of
+# the memory a PyTorch model uses (tensors live in native CPU memory or on the
+# GPU). These helpers measure what actually matters:
+#   - GPU : peak torch.cuda memory allocated during the block (with CUDA
+#           synchronisation so the timing is not just the kernel launch)
+#   - CPU : peak process memory (RSS) during the block, sampled by a
+#           background thread (needs psutil: pip install psutil)
+# Memory is reported as peak MINUS what was already allocated when the block
+# started, i.e. the extra memory the measured step needed. Data and models that
+# were loaded beforehand are not counted, so create the model inside the block
+# if you want its weights included (as ncf.py does for training).
+
+@contextmanager
+def track_resources(device=None):
+    """
+    Context manager returning a dict that is filled in when the block exits:
+        with track_resources(device) as res:
+            ...work...
+        res['time_s'], res['mem_mb']
+    """
+    stats = {'time_s': 0.0, 'mem_mb': 0.0}
+
+    try:
+        import torch
+    except ImportError:
+        torch = None
+
+    use_cuda = (torch is not None and device is not None
+                and torch.device(device).type == 'cuda' and torch.cuda.is_available())
+
+    if use_cuda:
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        baseline = torch.cuda.memory_allocated(device)
+        start = time.perf_counter()
+        try:
+            yield stats
+        finally:
+            torch.cuda.synchronize(device)
+            stats['time_s'] = time.perf_counter() - start
+            peak = torch.cuda.max_memory_allocated(device)
+            stats['mem_mb'] = max(peak - baseline, 0) / 1e6
+        return
+
+    # CPU path: sample the process RSS in a background thread
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+
+    if psutil is None:
+        print("WARNING: psutil not installed - CPU memory falls back to tracemalloc, which "
+              "does not see PyTorch tensors. Run 'pip install psutil' for accurate numbers.")
+        tracemalloc.start()
+        start = time.perf_counter()
+        try:
+            yield stats
+        finally:
+            stats['time_s'] = time.perf_counter() - start
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            stats['mem_mb'] = peak / 1e6
+        return
+
+    proc = psutil.Process(os.getpid())
+    baseline = proc.memory_info().rss
+    peak = [baseline]
+    stop = threading.Event()
+
+    def _sample():
+        while not stop.is_set():
+            peak[0] = max(peak[0], proc.memory_info().rss)
+            stop.wait(0.005)
+
+    sampler = threading.Thread(target=_sample, daemon=True)
+    sampler.start()
+    start = time.perf_counter()
+    try:
+        yield stats
+    finally:
+        stats['time_s'] = time.perf_counter() - start
+        stop.set()
+        sampler.join()
+        peak[0] = max(peak[0], proc.memory_info().rss)
+        stats['mem_mb'] = max(peak[0] - baseline, 0) / 1e6
+
+
+# Same metrics as evaluate(), but time and memory come from track_resources so they
+# are realistic for neural networks. device is the torch device the model runs on.
+def evaluate_nn(split_name, model, X, y, eval_meta, device=None):
+    with track_resources(device) as res:
+        # Ensure predicted ratings stay within the valid 1 to 5 star range
+        pred = np.clip(model.predict(X), 1, 5)
+
+    return _build_result(split_name, y, pred, eval_meta,
+                         res['time_s'], res['mem_mb'], time_digits=4)
+
 
 # Formats the evaluation metrics and appends them to the results CSV file
 def save_results(rows, params):

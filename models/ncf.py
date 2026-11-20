@@ -3,18 +3,16 @@ Neural Collaborative Filtering (NeuMF) for rating prediction on MovieLens 1M.
 
 Reads data/processed/ratings_scaled.parquet (built by preprocessing.py), trains
 on the 'train' rows, picks the best epoch on the 'val' rows, then evaluates
-train / val / test with utils.evaluate (RMSE, MAE, R2, accuracy, P/R/F1@20,
+train / val / test with utils.evaluate_nn (RMSE, MAE, R2, accuracy, P/R/F1@20,
 time, memory) and appends the rows to results/model_evaluation_results.csv
 via utils.save_results.
 
 Model: NeuMF with user / movie embeddings, plus scaled user / movie side
 features fed into the MLP branch.
 
-Requires: torch, numpy, pandas, pyarrow, scikit-learn
+Requires: torch, numpy, pandas, pyarrow, scikit-learn, psutil
 """
 import copy
-import time
-import tracemalloc
 
 import numpy as np
 import pandas as pd
@@ -22,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from preprocessing import load_ratings_scaled, load_ratings_preprocessed
-from utils import NON_FEATURE_COLS, evaluate, save_results
+from utils import NON_FEATURE_COLS, evaluate_nn, save_results, track_resources
 
 SEED = 42
 EMBED_DIM = 32
@@ -126,12 +124,12 @@ class NCF(nn.Module):
 
 
 # =====================================================================
-# Bridge to utils.evaluate
+# Bridge to utils.evaluate_nn
 # =====================================================================
 
 class NCFPredictor:
     """
-    Gives the torch model the sklearn-style .predict(X) that utils.evaluate expects.
+    Gives the torch model the sklearn-style .predict(X) that utils.evaluate_nn expects.
     X is just the row positions (np.arange(n)) within one split, because the NCF
     needs user / movie ids and side features that live in the split's tensors.
     """
@@ -154,13 +152,15 @@ class NCFPredictor:
 
 
 def evaluate_all_splits(label, model_factory, splits, meta, train_stats):
-    """Runs utils.evaluate on train/val/test and attaches the training cost columns."""
+    """Runs utils.evaluate_nn on train/val/test and attaches the training cost columns."""
     rows = []
     for split_name in ('train', 'val', 'test'):
         n = len(splits[split_name]['rating'])
         X = np.arange(n)
         y = splits[split_name]['rating'].cpu().numpy()
-        res = evaluate(split_name, model_factory(split_name), X, y, meta[split_name])
+        device = splits[split_name]['rating'].device
+        res = evaluate_nn(split_name, model_factory(split_name), X, y,
+                          meta[split_name], device=device)
         res['model'] = label
         res.update(train_stats)
         rows.append(res)
@@ -174,73 +174,63 @@ def evaluate_all_splits(label, model_factory, splits, meta, train_stats):
 def train_ncf(splits, info, use_features, device):
     """Trains with early stopping on val RMSE. Returns (best model, stats dict, params dict)."""
     set_seed()
-    model = NCF(
-        info['n_users'], info['n_movies'],
-        n_features=info['n_features'] if use_features else 0,
-        global_mean=info['global_mean'],
-    ).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE,
-                                 weight_decay=WEIGHT_DECAY)
-    loss_fn = nn.MSELoss()
-
     train, val = splits['train'], splits['val']
     n_train = len(train['rating'])
-    val_pred_model = NCFPredictor(model, val, use_features)
-
-    on_cuda = device.type == 'cuda'
-    if on_cuda:
-        torch.cuda.reset_peak_memory_stats()
-    else:
-        tracemalloc.start()
-    start_time = time.time()
 
     best = {'rmse': float('inf'), 'state': None, 'epoch': 0}
     stale, epochs_run = 0, 0
 
-    for epoch in range(1, MAX_EPOCHS + 1):
-        model.train()
-        perm = torch.randperm(n_train, device=device)
-        running_loss = 0.0
+    # Time and memory cover everything training needs: model creation (weights),
+    # optimizer state, every epoch and the per-epoch validation passes.
+    with track_resources(device) as res:
+        model = NCF(
+            info['n_users'], info['n_movies'],
+            n_features=info['n_features'] if use_features else 0,
+            global_mean=info['global_mean'],
+        ).to(device)
+        n_params = sum(p.numel() for p in model.parameters())
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE,
+                                     weight_decay=WEIGHT_DECAY)
+        loss_fn = nn.MSELoss()
+        val_pred_model = NCFPredictor(model, val, use_features)
 
-        for start in range(0, n_train, BATCH_SIZE):
-            idx = perm[start:start + BATCH_SIZE]
-            feats = train['features'][idx] if use_features else None
-            pred = model(train['user'][idx], train['movie'][idx], feats)
-            loss = loss_fn(pred, train['rating'][idx])
+        for epoch in range(1, MAX_EPOCHS + 1):
+            model.train()
+            perm = torch.randperm(n_train, device=device)
+            running_loss = 0.0
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item() * len(idx)
+            for start in range(0, n_train, BATCH_SIZE):
+                idx = perm[start:start + BATCH_SIZE]
+                feats = train['features'][idx] if use_features else None
+                pred = model(train['user'][idx], train['movie'][idx], feats)
+                loss = loss_fn(pred, train['rating'][idx])
 
-        epochs_run = epoch
-        train_rmse = (running_loss / n_train) ** 0.5
-        val_p = torch.from_numpy(val_pred_model.predict(np.arange(len(val['rating'])))).to(device)
-        val_rmse = float(torch.sqrt(((val_p - val['rating']) ** 2).mean()))
-        print(f"Epoch {epoch:02d} | train RMSE {train_rmse:.4f} | val RMSE {val_rmse:.4f}")
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item() * len(idx)
 
-        if val_rmse < best['rmse'] - 1e-4:
-            best.update(rmse=val_rmse, state=copy.deepcopy(model.state_dict()), epoch=epoch)
-            stale = 0
-        else:
-            stale += 1
-            if stale >= PATIENCE:
-                print(f"Early stopping (no val improvement for {PATIENCE} epochs)")
-                break
+            epochs_run = epoch
+            train_rmse = (running_loss / n_train) ** 0.5
+            val_p = torch.from_numpy(
+                val_pred_model.predict(np.arange(len(val['rating'])))).to(device)
+            val_rmse = float(torch.sqrt(((val_p - val['rating']) ** 2).mean()))
+            print(f"Epoch {epoch:02d} | train RMSE {train_rmse:.4f} | val RMSE {val_rmse:.4f}")
 
-    train_seconds = time.time() - start_time
-    if on_cuda:
-        peak_mb = torch.cuda.max_memory_allocated() / 1e6
-    else:
-        _, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        peak_mb = peak / 1e6   # Python-heap only; torch tensors are not tracked on CPU
+            if val_rmse < best['rmse'] - 1e-4:
+                best.update(rmse=val_rmse, state=copy.deepcopy(model.state_dict()), epoch=epoch)
+                stale = 0
+            else:
+                stale += 1
+                if stale >= PATIENCE:
+                    print(f"Early stopping (no val improvement for {PATIENCE} epochs)")
+                    break
 
     model.load_state_dict(best['state'])
     print(f"Best epoch: {best['epoch']} (val RMSE {best['rmse']:.4f})")
+    print(f"Training cost: {res['time_s']:.1f}s | {res['mem_mb']:.1f} MB peak extra memory")
 
-    stats = {'train_time_s': train_seconds, 'train_mem_mb': peak_mb}
+    stats = {'train_time_s': res['time_s'], 'train_mem_mb': res['mem_mb']}
     params = {
         'embed_dim': EMBED_DIM, 'mlp_layers': MLP_LAYERS, 'dropout': DROPOUT,
         'lr': LEARNING_RATE, 'weight_decay': WEIGHT_DECAY, 'batch_size': BATCH_SIZE,
@@ -258,7 +248,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    df = load_ratings_preprocessed() #change this to preprocessed to get the preprocessed data or scaled 
+    df = load_ratings_scaled() #change this to preprocessed to get the preprocessed data or scaled 
     splits, meta, info = prepare_data(df, device)
     del df
 

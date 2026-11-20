@@ -11,6 +11,7 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 SHOW_PLOTS = False
 RAW_DIR = "data/raw"
 OUTPUT_DIR = "images"
+RESULTS_FILE = os.path.join("results", "model_evaluation_results.csv")
 VALID_MIN, VALID_MAX = 1, 5     # MovieLens 1M ratings are whole stars, 1-5
 Z_THRESHOLD = 3
 
@@ -318,6 +319,116 @@ def feature_scaling(ratings, movies, users, ratings_per_user, ratings_per_movie)
 
 
 # ----------------------------------------------------------------------
+# F. Model Comparison (reads results/model_evaluation_results.csv)
+# ----------------------------------------------------------------------
+QUALITY_METRICS = ["RMSE", "MAE", "R2", "Classification Accuracy",
+                   "Precision@20", "Recall@20", "F1@20"]
+
+
+def _load_model_results(split="test"):
+    """Loads the results CSV and returns one row per model for the given split.
+
+    save_results() appends on every run, so if a model appears more than once
+    only its most recent row is kept.
+    """
+    if not os.path.exists(RESULTS_FILE):
+        print(f"{RESULTS_FILE} not found - run the model scripts first.")
+        return None
+
+    df = pd.read_csv(RESULTS_FILE)
+    df = df[df["Split"] == split]
+    if df.empty:
+        print(f"No '{split}' rows found in {RESULTS_FILE}.")
+        return None
+
+    df = df.drop_duplicates(subset=["Algorithm", "Dataset"], keep="last")
+    df["Model"] = df["Algorithm"].astype(str) + "\n(" + df["Dataset"].astype(str) + ")"
+    return df.set_index("Model")
+
+
+def _label_bars(ax, bars, fmt="{:.3f}"):
+    for bar in bars:
+        h = bar.get_height()
+        if np.isnan(h):
+            continue
+        ax.annotate(fmt.format(h), (bar.get_x() + bar.get_width() / 2, h),
+                    ha="center", va="bottom" if h >= 0 else "top",
+                    fontsize=7, xytext=(0, 2 if h >= 0 else -2),
+                    textcoords="offset points")
+
+
+def model_comparison():
+    """
+    Which split each plotted value comes from:
+      - performance metrics (RMSE, MAE, R2, ...) : test
+      - training time                            : train
+      - predict time                             : test
+      - predict memory                           : test
+    """
+    section("F. MODEL COMPARISON")
+    df = _load_model_results("test")          # performance, predict time, predict memory
+    train_df = _load_model_results("train")   # training time
+    if df is None:
+        return
+
+    models = df.index.tolist()
+    split = "test"
+
+    # Training time comes from the train rows only. Models that never wrote a train
+    # row (e.g. knn.py only saves val/test) get no bar in that panel.
+    if train_df is None:
+        train_time = pd.Series(np.nan, index=models)
+    else:
+        train_time = train_df["Training Time (s)"].reindex(models)
+    missing = train_time[train_time.isna()].index.tolist()
+    if missing:
+        print("No 'train' rows for: " + ", ".join(m.replace("\n", " ") for m in missing)
+              + " - skipped in the training-time plot.")
+    n_models = len(models)
+
+    # --- Plot 1: performance metrics (grouped by metric, one bar per model) ---
+    metrics = [m for m in QUALITY_METRICS if m in df.columns]
+    x = np.arange(len(metrics))
+    width = 0.8 / n_models
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    for i, model in enumerate(models):
+        bars = ax.bar(x + i * width - 0.4 + width / 2, df.loc[model, metrics].astype(float),
+                      width, label=model.replace("\n", " "), edgecolor="black")
+        _label_bars(ax, bars)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics)
+    ax.set_ylabel("Score")
+    ax.set_title(f"Model Performance Comparison ({split} split)\n"
+                 "Lower is better for RMSE / MAE; higher is better for the rest")
+    ax.legend(fontsize=8, ncol=2)
+    finish_plot("model_comparison_performance.png")
+
+    # --- Plot 2: cost (training time, predict time, predict memory) ---
+    cost_panels = [
+        ("Training time (s) - train split", train_time),
+        ("Predict time (s) - test split", df["Predict Time (s)"]),
+        ("Predict memory (MB) - test split", df["Predict Memory (MB)"]),
+    ]
+
+    fig, axes = plt.subplots(1, len(cost_panels), figsize=(5.5 * len(cost_panels), 6))
+    for ax, (title, values) in zip(axes, cost_panels):
+        bars = ax.bar(models, values.astype(float).to_numpy(), edgecolor="black")
+        _label_bars(ax, bars, fmt="{:,.2f}")
+        ax.set_title(title)
+        ax.tick_params(axis="x", labelsize=8)
+    fig.suptitle("Model Cost Comparison")
+    finish_plot("model_comparison_cost.png")
+
+    summary = df[[m for m in QUALITY_METRICS if m in df.columns]].copy()
+    summary["Training Time (s)"] = train_time
+    summary["Predict Time (s)"] = df["Predict Time (s)"]
+    summary["Predict Memory (MB)"] = df["Predict Memory (MB)"]
+    print(summary.round(4).to_string())
+
+
+# ----------------------------------------------------------------------
 # Original inspection function
 # ----------------------------------------------------------------------
 def inspect_dataset(dataframe, file_name):
@@ -345,14 +456,15 @@ def inspect_dataset(dataframe, file_name):
 # ----------------------------------------------------------------------
 def main():
     ratings = load_ratings_raw()
-    # movies = load_movies()
-    # users = load_users()
+    movies = load_movies()
+    users = load_users()
 
-    # dataset_overview(ratings, movies, users)                                    # A
-    # ratings_per_user, ratings_per_movie = data_distribution(ratings)            # B
-    # outlier_detection(ratings_per_user, ratings_per_movie)                      # C
-    # data_quality(ratings, movies, users, ratings_per_user, ratings_per_movie)   # D
-    # feature_scaling(ratings, movies, users, ratings_per_user, ratings_per_movie)  # E
+    dataset_overview(ratings, movies, users)                                    # A
+    ratings_per_user, ratings_per_movie = data_distribution(ratings)            # B
+    outlier_detection(ratings_per_user, ratings_per_movie)                      # C
+    data_quality(ratings, movies, users, ratings_per_user, ratings_per_movie)   # D
+    feature_scaling(ratings, movies, users, ratings_per_user, ratings_per_movie)  # E
+    model_comparison()                                                          # F
 
 
 if __name__ == "__main__":
