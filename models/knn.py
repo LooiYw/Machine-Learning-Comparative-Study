@@ -1,9 +1,3 @@
-# KNN regressor (ready for hyperparameter tuning)
-# Data comes from preprocessing.py:
-#   load_ratings_preprocessed() -> no feature scaling
-#   load_ratings_scaled()       -> with feature scaling
-# To tune later: pass new values to build_model(params), or use GridSearchCV with the step name, e.g. {'knn__n_neighbors': [10, 20, 30]}
-
 import gc
 import json
 import os
@@ -77,9 +71,9 @@ def run_knn(params=None):
         tracemalloc.stop()
         train_mem_mb = peak_mem / 1e6
         
-        print(f"  train time: {train_time:.2f}s | train memory: {train_mem_mb:.2f}MB")
+        print(f"  Train Time: {train_time:.2f}s | Train Memory: {train_mem_mb:.2f}MB")
 
-        for name in ('val', 'test'):
+        for name in ('train', 'val', 'test'):
             X, y = splits[name]
             
             # 4. GET META FOR THE SPLIT AND PASS TO EVALUATE
@@ -90,7 +84,7 @@ def run_knn(params=None):
             res.update(model=label, train_time_s=train_time, train_mem_mb=train_mem_mb)
             results.append(res)
 
-        save_results(results[-2:], {**BASELINE_PARAMS, **(params or {})})
+        save_results(results[-3:], {**BASELINE_PARAMS, **(params or {})})
     return results
 
 if __name__ == "__main__":
