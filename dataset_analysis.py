@@ -321,8 +321,25 @@ def feature_scaling(ratings, movies, users, ratings_per_user, ratings_per_movie)
 # ----------------------------------------------------------------------
 # F. Model Comparison (reads results/model_evaluation_results.csv)
 # ----------------------------------------------------------------------
-QUALITY_METRICS = ["RMSE", "MAE", "R2", "Classification Accuracy",
+QUALITY_METRICS = ["RMSE", "R2", "Classification Accuracy",
                    "Precision@20", "Recall@20", "F1@20"]
+
+# Performance metrics are split into separate plots because they sit on
+# different scales / have different meanings.
+PERFORMANCE_PLOTS = {
+    "rmse": {
+        "metrics": ["RMSE"],
+        "title": "RMSE",
+    },
+    "classification": {
+        "metrics": ["Classification Accuracy", "Precision@20", "Recall@20", "F1@20"],
+        "title": "Classification / ranking metrics (higher is better)",
+    },
+    "r2": {
+        "metrics": ["R2"],
+        "title": "R\u00b2 (higher is better)",
+    },
+}
 
 
 # Dataset groups plotted separately. Adjust the matching rules if your
@@ -357,7 +374,17 @@ def _load_model_results(split="test", group=None):
     return df.set_index("Model")
 
 
-def _label_bars(ax, bars, fmt="{:.3f}", fontsize=4.5):
+def _get_colors(n):
+    """Returns n distinct colours so bars never repeat a colour.
+    <=10 models: tab10, <=20: tab20, more: evenly sampled from a continuous map."""
+    if n <= 10:
+        return [plt.get_cmap("tab10")(i) for i in range(n)]
+    if n <= 20:
+        return [plt.get_cmap("tab20")(i) for i in range(n)]
+    return [plt.get_cmap("turbo")(v) for v in np.linspace(0, 1, n)]
+
+
+def _label_bars(ax, bars, fmt="{:.3f}", fontsize=6):
     for bar in bars:
         h = bar.get_height()
         if np.isnan(h):
@@ -366,6 +393,72 @@ def _label_bars(ax, bars, fmt="{:.3f}", fontsize=4.5):
                     ha="center", va="bottom" if h >= 0 else "top",
                     fontsize=fontsize, xytext=(0, 2 if h >= 0 else -2),
                     textcoords="offset points")
+
+
+def _plot_performance(df, models, metric_names, title, group, split, filename):
+    """Grouped bar chart: metrics on the x-axis, one bar per model."""
+    metrics = [m for m in metric_names if m in df.columns]
+    if not metrics:
+        print(f"[{group}] None of {metric_names} found in results - skipped {filename}.")
+        return
+
+    n_models = len(models)
+    x = np.arange(len(metrics))
+    width = 0.8 / n_models
+
+    colors = _get_colors(n_models)
+    fig, ax = plt.subplots(figsize=(max(6, 2.5 * len(metrics) + 3), 6))
+    for i, model in enumerate(models):
+        bars = ax.bar(x + i * width - 0.4 + width / 2,
+                      df.loc[model, metrics].astype(float),
+                      width, label=model.replace("\n", " "), color=colors[i],
+                      edgecolor="black")
+        _label_bars(ax, bars)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels([m.replace("R2", "R\u00b2") for m in metrics])
+    ax.set_ylabel("Score")
+    ax.set_title(f"{title} - {group} data ({split} split)")
+    ax.legend(fontsize=8, ncol=2)
+    finish_plot(filename)
+
+
+def _plot_cost(models, cost, group):
+    """Horizontal bar charts: one panel per cost metric, models on the y-axis.
+
+    The metrics have different units (seconds vs MB), so each gets its own
+    panel with its own x-axis. Models with no value show "n/a".
+    """
+    cost = cost.astype(float)
+    n_models, n_metrics = cost.shape
+    labels = [m.replace("\n", " ") for m in models]
+    colors = _get_colors(n_models)
+    y = np.arange(n_models)
+
+    fig, axes = plt.subplots(1, n_metrics, sharey=True,
+                             figsize=(5.5 * n_metrics, max(4, 0.55 * n_models + 2)))
+    axes = np.atleast_1d(axes)
+    for ax, col in zip(axes, cost.columns):
+        vals = cost[col].to_numpy()
+        bars = ax.barh(y, np.nan_to_num(vals), color=colors, edgecolor="black")
+        for yi, v, bar in zip(y, vals, bars):
+            if np.isnan(v):
+                ax.annotate("n/a", (0, yi), xytext=(3, 0), textcoords="offset points",
+                            va="center", fontsize=8, color="grey")
+            else:
+                ax.annotate(f"{v:,.2f}", (bar.get_width(), yi), xytext=(3, 0),
+                            textcoords="offset points", va="center", fontsize=8)
+        vmax = np.nanmax(vals) if np.isfinite(vals).any() else 1.0
+        ax.set_xlim(0, vmax * 1.18 if vmax > 0 else 1.0)
+        ax.set_title(col.replace("\n", " - "), fontsize=10)
+        ax.set_xlabel(col.split("\n")[0])
+
+    axes[0].set_yticks(y)
+    axes[0].set_yticklabels(labels, fontsize=9)
+    axes[0].invert_yaxis()          # first model at the top
+    axes[0].set_ylabel("Model")
+    fig.suptitle(f"Baseline Model Cost Comparison - {group} data")
+    finish_plot(f"model_comparison_cost_{group}.png")
 
 
 def _plot_group(group):
@@ -379,7 +472,7 @@ def _plot_group(group):
     split = "test"
 
     # Training time comes from the train rows only. Models that never wrote a train
-    # row (e.g. knn.py only saves val/test) get no bar in that panel.
+    # row (e.g. knn.py only saves val/test) show as n/a in the cost heatmap.
     if train_df is None:
         train_time = pd.Series(np.nan, index=models)
     else:
@@ -388,43 +481,23 @@ def _plot_group(group):
     if missing:
         print(f"[{group}] No 'train' rows for: "
               + ", ".join(m.replace("\n", " ") for m in missing)
-              + " - skipped in the training-time plot.")
-    n_models = len(models)
+              + " - shown as n/a in the training-time column.")
 
-    # --- Plot 1: performance metrics (grouped by metric, one bar per model) ---
-    metrics = [m for m in QUALITY_METRICS if m in df.columns]
-    x = np.arange(len(metrics))
-    width = 0.8 / n_models
+    # --- Performance plots: errors, classification metrics, R^2 (separate) ---
+    for key, cfg in PERFORMANCE_PLOTS.items():
+        _plot_performance(
+            df, models, cfg["metrics"],
+            f"Baseline Model Performance - {cfg['title']}",
+            group, split, f"model_comparison_performance_{key}_{group}.png",
+        )
 
-    fig, ax = plt.subplots(figsize=(13, 6))
-    for i, model in enumerate(models):
-        bars = ax.bar(x + i * width - 0.4 + width / 2, df.loc[model, metrics].astype(float),
-                      width, label=model.replace("\n", " "), edgecolor="black")
-        _label_bars(ax, bars)
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_xticks(x)
-    ax.set_xticklabels(metrics)
-    ax.set_ylabel("Score")
-    ax.set_title(f"Baseline Model Performance Comparison - {group} data ({split} split)\n"
-                 "Lower is better for RMSE / MAE; higher is better for the rest")
-    ax.legend(fontsize=8, ncol=2)
-    finish_plot(f"model_comparison_performance_{group}.png")
-
-    # --- Plot 2: cost (training time, predict time, predict memory) ---
-    cost_panels = [
-        ("Training time (s) - train split", train_time),
-        ("Predict time (s) - test split", df["Predict Time (s)"]),
-        ("Predict memory (MB) - test split", df["Predict Memory (MB)"]),
-    ]
-
-    fig, axes = plt.subplots(1, len(cost_panels), figsize=(5.5 * len(cost_panels), 6))
-    for ax, (title, values) in zip(axes, cost_panels):
-        bars = ax.bar(models, values.astype(float).to_numpy(), edgecolor="black")
-        _label_bars(ax, bars, fmt="{:,.2f}")
-        ax.set_title(title)
-        ax.tick_params(axis="x", labelsize=8)
-    fig.suptitle(f"Baseline Model Cost Comparison - {group} data")
-    finish_plot(f"model_comparison_cost_{group}.png")
+    # --- Cost plot: models (y) x metrics (x) ---
+    cost = pd.DataFrame({
+        "Training time (s)\n(train split)": train_time,
+        "Predict time (s)\n(test split)": df["Predict Time (s)"],
+        "Predict memory (MB)\n(test split)": df["Predict Memory (MB)"],
+    })
+    _plot_cost(models, cost, group)
 
     summary = df[[m for m in QUALITY_METRICS if m in df.columns]].copy()
     summary["Training Time (s)"] = train_time
@@ -442,10 +515,14 @@ def model_comparison():
       - training time                            : train
       - predict time                             : test
       - predict memory                           : test
+    Output per group: RMSE, classification and R^2 performance plots,
+    plus one cost heatmap.
     """
     section("F. MODEL COMPARISON")
     for group in DATASET_GROUPS:
         _plot_group(group)
+
+
 # ----------------------------------------------------------------------
 # Original inspection function
 # ----------------------------------------------------------------------
