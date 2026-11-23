@@ -325,8 +325,17 @@ QUALITY_METRICS = ["RMSE", "MAE", "R2", "Classification Accuracy",
                    "Precision@20", "Recall@20", "F1@20"]
 
 
-def _load_model_results(split="test"):
-    """Loads the results CSV and returns one row per model for the given split.
+# Dataset groups plotted separately. Adjust the matching rules if your
+# "Dataset" column uses different labels.
+DATASET_GROUPS = {
+    "preprocessed": lambda s: ~s.str.contains("scale", case=False),
+    "scaled":       lambda s: s.str.contains("scale", case=False),
+}
+
+
+def _load_model_results(split="test", group=None):
+    """Loads the results CSV and returns one row per model for the given split
+    (and dataset group, if given).
 
     save_results() appends on every run, so if a model appears more than once
     only its most recent row is kept.
@@ -337,37 +346,32 @@ def _load_model_results(split="test"):
 
     df = pd.read_csv(RESULTS_FILE)
     df = df[df["Split"] == split]
+    if group is not None:
+        df = df[DATASET_GROUPS[group](df["Dataset"].astype(str))]
     if df.empty:
-        print(f"No '{split}' rows found in {RESULTS_FILE}.")
+        print(f"No '{split}' rows found for the {group} group in {RESULTS_FILE}.")
         return None
 
-    df = df.drop_duplicates(subset=["Algorithm", "Dataset"], keep="last")
-    df["Model"] = df["Algorithm"].astype(str) + "\n(" + df["Dataset"].astype(str) + ")"
+    df = df.drop_duplicates(subset=["Algorithm", "Dataset"], keep="last").copy()
+    df["Model"] = df["Algorithm"].astype(str)
     return df.set_index("Model")
 
 
-def _label_bars(ax, bars, fmt="{:.3f}"):
+def _label_bars(ax, bars, fmt="{:.3f}", fontsize=4.5):
     for bar in bars:
         h = bar.get_height()
         if np.isnan(h):
             continue
         ax.annotate(fmt.format(h), (bar.get_x() + bar.get_width() / 2, h),
                     ha="center", va="bottom" if h >= 0 else "top",
-                    fontsize=7, xytext=(0, 2 if h >= 0 else -2),
+                    fontsize=fontsize, xytext=(0, 2 if h >= 0 else -2),
                     textcoords="offset points")
 
 
-def model_comparison():
-    """
-    Which split each plotted value comes from:
-      - performance metrics (RMSE, MAE, R2, ...) : test
-      - training time                            : train
-      - predict time                             : test
-      - predict memory                           : test
-    """
-    section("F. MODEL COMPARISON")
-    df = _load_model_results("test")          # performance, predict time, predict memory
-    train_df = _load_model_results("train")   # training time
+def _plot_group(group):
+    """Draws the performance and cost plots for one dataset group."""
+    df = _load_model_results("test", group)          # performance, predict time/memory
+    train_df = _load_model_results("train", group)   # training time
     if df is None:
         return
 
@@ -382,7 +386,8 @@ def model_comparison():
         train_time = train_df["Training Time (s)"].reindex(models)
     missing = train_time[train_time.isna()].index.tolist()
     if missing:
-        print("No 'train' rows for: " + ", ".join(m.replace("\n", " ") for m in missing)
+        print(f"[{group}] No 'train' rows for: "
+              + ", ".join(m.replace("\n", " ") for m in missing)
               + " - skipped in the training-time plot.")
     n_models = len(models)
 
@@ -400,10 +405,10 @@ def model_comparison():
     ax.set_xticks(x)
     ax.set_xticklabels(metrics)
     ax.set_ylabel("Score")
-    ax.set_title(f"Model Performance Comparison ({split} split)\n"
+    ax.set_title(f"Baseline Model Performance Comparison - {group} data ({split} split)\n"
                  "Lower is better for RMSE / MAE; higher is better for the rest")
     ax.legend(fontsize=8, ncol=2)
-    finish_plot("model_comparison_performance.png")
+    finish_plot(f"model_comparison_performance_{group}.png")
 
     # --- Plot 2: cost (training time, predict time, predict memory) ---
     cost_panels = [
@@ -418,16 +423,29 @@ def model_comparison():
         _label_bars(ax, bars, fmt="{:,.2f}")
         ax.set_title(title)
         ax.tick_params(axis="x", labelsize=8)
-    fig.suptitle("Model Cost Comparison")
-    finish_plot("model_comparison_cost.png")
+    fig.suptitle(f"Baseline Model Cost Comparison - {group} data")
+    finish_plot(f"model_comparison_cost_{group}.png")
 
     summary = df[[m for m in QUALITY_METRICS if m in df.columns]].copy()
     summary["Training Time (s)"] = train_time
     summary["Predict Time (s)"] = df["Predict Time (s)"]
     summary["Predict Memory (MB)"] = df["Predict Memory (MB)"]
+    print(f"\n{group.upper()} DATA")
     print(summary.round(4).to_string())
 
 
+def model_comparison():
+    """
+    Produces separate plots for preprocessed and scaled data.
+    Which split each plotted value comes from:
+      - performance metrics (RMSE, MAE, R2, ...) : test
+      - training time                            : train
+      - predict time                             : test
+      - predict memory                           : test
+    """
+    section("F. MODEL COMPARISON")
+    for group in DATASET_GROUPS:
+        _plot_group(group)
 # ----------------------------------------------------------------------
 # Original inspection function
 # ----------------------------------------------------------------------
