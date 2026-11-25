@@ -1,0 +1,14 @@
+{
+  "mlp_structure": "decreasing",
+  "num_layers": 3,
+  "num_neurons": 64,
+  "mlp_layers": [
+    32,
+    21,
+    11
+  ],
+  "embed_dim": 32,
+  "lr": 0.0001,
+  "dropout": 0.0,
+  "weight_decay": 0.0
+}

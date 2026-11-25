@@ -12,6 +12,7 @@ NON_FEATURE_COLS = ['userId', 'movieId', 'rating', 'split']
 
 # Path where the final evaluation results are saved
 RESULTS_FILE = os.path.join('results', 'model_evaluation_results.csv')
+TUNING_RESULTS_FILE = os.path.join('results', 'tuned_model_evaluation_results.csv')
 
 # Separates features (X) and target ratings (y), and retains metadata for ranking metrics
 def get_splits(df):
@@ -216,3 +217,35 @@ def save_results(rows, params):
     # Create a new header only if the file does not exist yet
     write_header = not os.path.exists(RESULTS_FILE)
     out.to_csv(RESULTS_FILE, mode='a', header=write_header, index=False)
+    
+def save_tuning_results(rows, params):
+    os.makedirs(os.path.dirname(TUNING_RESULTS_FILE), exist_ok=True)
+    out = pd.DataFrame(rows)
+    
+    # Extract algorithm and dataset names from the model label string
+    out['Algorithm'] = out['model'].str.split('_').str[0]
+    out['Dataset'] = out['model'].str.split('_', n=1).str[1].str.lower()
+    
+    # Automatically rename the training time/memory columns coming from your model files
+    # This prevents you from having to modify the 4 model files again!
+    out.rename(columns={
+        'train_time_s': 'Training Time (s)',
+        'train_mem_mb': 'Training Memory (MB)'
+    }, inplace=True)
+    
+    # Round the training columns as well
+    out['Training Time (s)'] = out['Training Time (s)'].round(2)
+    out['Training Memory (MB)'] = out['Training Memory (MB)'].round(2)
+    
+    # Convert the dictionary of parameters into a JSON string for easy logging
+    out['Parameters'] = json.dumps(params, default=str)
+    
+    # Organize all requested columns in a fixed, readable order
+    cols = ['Algorithm', 'Dataset', 'Split', 'RMSE', 'MAE', 'R2', 'Classification Accuracy', 
+            'Precision@20', 'Recall@20', 'F1@20', 'Training Time (s)', 'Training Memory (MB)', 
+            'Predict Time (s)', 'Predict Memory (MB)', 'Parameters']
+    out = out[cols]
+    
+    # Create a new header only if the file does not exist yet
+    write_header = not os.path.exists(TUNING_RESULTS_FILE)
+    out.to_csv(TUNING_RESULTS_FILE, mode='a', header=write_header, index=False)
