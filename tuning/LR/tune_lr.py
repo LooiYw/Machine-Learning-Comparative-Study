@@ -41,7 +41,7 @@ def save_history(rows):
 
 
 def plot_stage(values, train_rmses, val_rmses, param_name, best_val, stage_idx, log_x=False):
-    plt.figure(figsize=(8, 5))
+    plt.figure(figsize=(8.5, 5))
     is_numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values)
 
     if is_numeric:
@@ -49,15 +49,36 @@ def plot_stage(values, train_rmses, val_rmses, param_name, best_val, stage_idx, 
         plot_fn(values, train_rmses, marker='o', label='Train RMSE')
         plot_fn(values, val_rmses, marker='s', label='Validation RMSE')
         plt.axvline(best_val, color='r', linestyle='--', label=f'Best={best_val}')
+        for x_val, y_val in zip(values, val_rmses):
+            plt.annotate(f"{y_val:.4f}", (x_val, y_val), textcoords="offset points",
+                         xytext=(0, 8), ha='center', fontsize=8, color='darkorange')
     else:
         labels = [str(v) for v in values]
         x = np.arange(len(labels))
-        plt.plot(x, train_rmses, marker='o', label='Train RMSE')
-        plt.plot(x, val_rmses, marker='s', label='Validation RMSE')
-        plt.xticks(x, labels)
-        plt.axvline(labels.index(str(best_val)), color='r', linestyle='--', label=f'Best={best_val}')
+        width = 0.35
+        bars_tr = plt.bar(x - width / 2, train_rmses, width, label='Train RMSE', color='#1f77b4')
+        bars_va = plt.bar(x + width / 2, val_rmses, width, label='Validation RMSE', color='#ff7f0e')
 
-    plt.title(f'Ridge (LR) Stage {stage_idx}: {param_name}')
+        best_idx = labels.index(str(best_val))
+        bars_va[best_idx].set_edgecolor('red')
+        bars_va[best_idx].set_linewidth(2.0)
+
+        for bar in bars_tr:
+            h = bar.get_height()
+            plt.annotate(f"{h:.4f}", (bar.get_x() + bar.get_width() / 2, h),
+                         textcoords="offset points", xytext=(0, 4), ha='center', fontsize=8)
+        for bar in bars_va:
+            h = bar.get_height()
+            plt.annotate(f"{h:.4f}", (bar.get_x() + bar.get_width() / 2, h),
+                         textcoords="offset points", xytext=(0, 4), ha='center', fontsize=8)
+
+        all_vals = train_rmses + val_rmses
+        span = max(all_vals) - min(all_vals)
+        margin = max(span * 0.3, 0.002)
+        plt.ylim(max(0, min(all_vals) - margin), max(all_vals) + margin * 1.4)
+        plt.xticks(x, labels)
+
+    plt.title(f'Ridge (LR) Stage {stage_idx}: {param_name} (Best={best_val})')
     plt.xlabel(param_name)
     plt.ylabel('RMSE')
     plt.legend()
@@ -78,7 +99,7 @@ def tune_lr():
     X_test, y_test = imputer.transform(splits['test'][0]), splits['test'][1]
 
     stages = [
-        ('alpha', [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0], True),
+        ('alpha', [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0], True),
         ('fit_intercept', [True, False], False),
         ('solver', ['auto', 'svd', 'cholesky', 'lsqr', 'sag'], False),
     ]
