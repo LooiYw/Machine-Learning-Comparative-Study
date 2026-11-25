@@ -1,4 +1,5 @@
 import datetime
+import itertools
 import json
 import os
 import time
@@ -22,14 +23,6 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 
 utils.RESULTS_FILE = os.path.join('results', 'tuned_model_evaluation_results.csv')
 
-BASELINE_PARAMS = {
-    'criterion': 'squared_error',
-    'max_depth': 15,
-    'min_samples_split': 2,
-    'min_samples_leaf': 1,
-    'random_state': 42,
-}
-
 
 def rmse_score(y_true, y_pred):
     return float(np.sqrt(mean_squared_error(y_true, np.clip(y_pred, 1, 5))))
@@ -37,54 +30,138 @@ def rmse_score(y_true, y_pred):
 
 def save_history(rows):
     df_hist = pd.DataFrame(rows)
+    df_hist['Train RMSE'] = df_hist['Train RMSE'].round(4)
+    df_hist['Val RMSE'] = df_hist['Val RMSE'].round(4)
     write_header = not os.path.exists(HISTORY_FILE)
     df_hist.to_csv(HISTORY_FILE, mode='a', header=write_header, index=False)
 
 
-def plot_stage(values, train_rmses, val_rmses, param_name, best_val, stage_idx):
-    plt.figure(figsize=(8.5, 5))
-    is_numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values)
+def plot_dt_results(df_run, best_params):
+    df_step1 = df_run[df_run['Step'] == 1]
+    df_step2 = df_run[df_run['Step'] == 2]
 
-    if is_numeric:
-        plt.plot(values, train_rmses, marker='o', label='Train RMSE')
-        plt.plot(values, val_rmses, marker='s', label='Validation RMSE')
-        plt.axvline(best_val, color='r', linestyle='--', label=f'Best={best_val}')
-        for x_val, y_val in zip(values, val_rmses):
-            plt.annotate(f"{y_val:.4f}", (x_val, y_val), textcoords="offset points",
-                         xytext=(0, 8), ha='center', fontsize=8, color='darkorange')
-    else:
-        labels = [str(v) for v in values]
-        x = np.arange(len(labels))
-        width = 0.35
-        bars_tr = plt.bar(x - width / 2, train_rmses, width, label='Train RMSE', color='#1f77b4')
-        bars_va = plt.bar(x + width / 2, val_rmses, width, label='Validation RMSE', color='#ff7f0e')
+    # 1. Heatmap: max_depth vs min_samples_leaf (at best min_samples_split)
+    sub_hm = df_step1[df_step1['min_samples_split'] == best_params['min_samples_split']]
+    pivot = sub_hm.pivot(index='max_depth', columns='min_samples_leaf', values='Val RMSE')
 
-        best_idx = labels.index(str(best_val))
-        bars_va[best_idx].set_edgecolor('red')
-        bars_va[best_idx].set_linewidth(2.0)
+    plt.figure(figsize=(9, 5.5))
+    im = plt.imshow(pivot.values, cmap='viridis_r', aspect='auto')
+    plt.colorbar(im, label='Validation RMSE')
+    plt.xticks(range(len(pivot.columns)), pivot.columns)
+    plt.yticks(range(len(pivot.index)), pivot.index)
+    plt.xlabel('min_samples_leaf')
+    plt.ylabel('max_depth')
+    plt.title(f"Decision Tree Grid Search Heatmap (min_samples_split={best_params['min_samples_split']})")
 
-        for bar in bars_tr:
-            h = bar.get_height()
-            plt.annotate(f"{h:.4f}", (bar.get_x() + bar.get_width() / 2, h),
-                         textcoords="offset points", xytext=(0, 4), ha='center', fontsize=8)
-        for bar in bars_va:
-            h = bar.get_height()
-            plt.annotate(f"{h:.4f}", (bar.get_x() + bar.get_width() / 2, h),
-                         textcoords="offset points", xytext=(0, 4), ha='center', fontsize=8)
+    for i in range(len(pivot.index)):
+        for j in range(len(pivot.columns)):
+            val = pivot.values[i, j]
+            plt.text(j, i, f"{val:.4f}", ha='center', va='center',
+                     color='white' if val > pivot.values.mean() else 'black', fontsize=8.5)
 
-        all_vals = train_rmses + val_rmses
-        span = max(all_vals) - min(all_vals)
-        margin = max(span * 0.3, 0.002)
-        plt.ylim(max(0, min(all_vals) - margin), max(all_vals) + margin * 1.4)
-        plt.xticks(x, labels)
+    plt.savefig(os.path.join(PLOTS_DIR, 'dt_grid_heatmap.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
-    plt.title(f'Decision Tree Stage {stage_idx}: {param_name} (Best={best_val})')
-    plt.xlabel(param_name)
+    # 2. Top-10 Structural Configurations Bar Chart (Train vs Val RMSE)
+    top10 = df_step1.sort_values('Val RMSE', kind='mergesort').head(10).reset_index(drop=True)
+    labels = [
+        f"d={r['max_depth']}, s={r['min_samples_split']}, l={r['min_samples_leaf']}"
+        for _, r in top10.iterrows()
+    ]
+    x = np.arange(len(labels))
+    width = 0.35
+
+    plt.figure(figsize=(10.5, 5))
+    plt.bar(x - width / 2, top10['Train RMSE'], width, label='Train RMSE', color='#1f77b4')
+    bars_va = plt.bar(x + width / 2, top10['Val RMSE'], width, label='Validation RMSE', color='#ff7f0e')
+    bars_va[0].set_edgecolor('red')
+    bars_va[0].set_linewidth(2.0)
+
+    for bar in bars_va:
+        h = bar.get_height()
+        plt.annotate(f"{h:.4f}", (bar.get_x() + bar.get_width() / 2, h),
+                     textcoords="offset points", xytext=(0, 4), ha='center', fontsize=7.5)
+
+    all_v = top10['Train RMSE'].tolist() + top10['Val RMSE'].tolist()
+    margin = max((max(all_v) - min(all_v)) * 0.25, 0.005)
+    plt.ylim(max(0, min(all_v) - margin), max(all_v) + margin * 1.4)
+    plt.xticks(x, labels, rotation=30, ha='right', fontsize=8.5)
+    plt.title('Decision Tree Grid Search: Top 10 Structural Configurations')
     plt.ylabel('RMSE')
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.6)
-    save_path = os.path.join(PLOTS_DIR, f'dt_stage{stage_idx}_{param_name}.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(PLOTS_DIR, 'dt_grid_top10.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 3. Per-Parameter Slice Line Plots (evenly spaced x-axis showing exact tested values)
+    struct_params = ['max_depth', 'min_samples_split', 'min_samples_leaf']
+    for param_name in struct_params:
+        mask = pd.Series(True, index=df_step1.index)
+        for other_p in struct_params:
+            if other_p != param_name:
+                mask &= (df_step1[other_p] == best_params[other_p])
+        sub_p = df_step1[mask].sort_values(param_name)
+
+        values = sub_p[param_name].tolist()
+        tr_vals = sub_p['Train RMSE'].tolist()
+        va_vals = sub_p['Val RMSE'].tolist()
+        best_val = best_params[param_name]
+
+        x_pos = np.arange(len(values))
+        best_idx = values.index(best_val)
+
+        plt.figure(figsize=(8.5, 5))
+        plt.plot(x_pos, tr_vals, marker='o', label='Train RMSE')
+        plt.plot(x_pos, va_vals, marker='s', label='Validation RMSE')
+        plt.axvline(best_idx, color='r', linestyle='--', label=f'Best={best_val}')
+
+        for xi, y_val in zip(x_pos, va_vals):
+            plt.annotate(f"{y_val:.4f}", (xi, y_val), textcoords="offset points",
+                         xytext=(0, 8), ha='center', fontsize=8.5, color='darkorange')
+
+        plt.xticks(x_pos, [str(v) for v in values])
+        plt.margins(y=0.15)
+        if param_name in ('min_samples_split', 'min_samples_leaf'):
+            plt.xlabel(f"{param_name}  (← Higher Complexity | Stronger Regularization →)")
+        else:
+            plt.xlabel(param_name)
+        plt.ylabel('RMSE')
+        plt.title(f'Decision Tree Grid Search Slice: {param_name} (Best={best_val})')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.savefig(os.path.join(PLOTS_DIR, f'dt_grid_param_{param_name}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    # 4. Grouped Bar Chart for criterion (Step 2 at winning tree structure)
+    c_labels = df_step2['criterion'].tolist()
+    c_tr = df_step2['Train RMSE'].tolist()
+    c_va = df_step2['Val RMSE'].tolist()
+
+    xc = np.arange(len(c_labels))
+    width = 0.35
+    plt.figure(figsize=(8.5, 5))
+    bars_tr = plt.bar(xc - width / 2, c_tr, width, label='Train RMSE', color='#1f77b4')
+    bars_va = plt.bar(xc + width / 2, c_va, width, label='Validation RMSE', color='#ff7f0e')
+
+    best_c_idx = c_labels.index(best_params['criterion'])
+    bars_va[best_c_idx].set_edgecolor('red')
+    bars_va[best_c_idx].set_linewidth(2.0)
+
+    for bar in list(bars_tr) + list(bars_va):
+        h = bar.get_height()
+        plt.annotate(f"{h:.4f}", (bar.get_x() + bar.get_width() / 2, h),
+                     textcoords="offset points", xytext=(0, 4), ha='center', fontsize=8.5)
+
+    all_c = c_tr + c_va
+    c_margin = max((max(all_c) - min(all_c)) * 0.3, 0.002)
+    plt.ylim(max(0, min(all_c) - c_margin), max(all_c) + c_margin * 1.4)
+    plt.xticks(xc, c_labels)
+    plt.title(f"Decision Tree Step 2: criterion (Best={best_params['criterion']})")
+    plt.xlabel('criterion')
+    plt.ylabel('RMSE')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig(os.path.join(PLOTS_DIR, 'dt_grid_param_criterion.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
 
@@ -98,52 +175,103 @@ def tune_dt():
     X_val, y_val = imputer.transform(splits['val'][0]), splits['val'][1]
     X_test, y_test = imputer.transform(splits['test'][0]), splits['test'][1]
 
-    stages = [
-        ('max_depth', [5, 10, 15, 20, 25, 30]),
-        ('min_samples_split', [2, 10, 20, 50, 100, 200]),
-        ('min_samples_leaf', [1, 5, 10, 20, 50, 100]),
-        ('criterion', ['squared_error', 'friedman_mse', 'poisson']),
-    ]
+    # Step 1: Joint grid over interacting structural parameters (4 x 7 x 6 = 168 combos)
+    param_grid = {
+        'max_depth': [8, 10, 12, 15],
+        'min_samples_split': [2, 50, 100, 150, 200, 300, 500],
+        'min_samples_leaf': [1, 10, 50, 100, 150, 200],
+    }
+    criteria = ['squared_error', 'friedman_mse', 'poisson']
 
-    current_params = BASELINE_PARAMS.copy()
+    combos = list(itertools.product(
+        param_grid['max_depth'],
+        param_grid['min_samples_split'],
+        param_grid['min_samples_leaf'],
+    ))
+
     run_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     history_rows = []
+    best_val_rmse = float('inf')
+    best_struct = None
+    trial_num = 0
 
-    print("\n=== Sequential Tuning: Decision Tree (DT) ===")
-    for stage_idx, (param_name, values) in enumerate(stages, start=1):
-        print(f"\n--- Stage {stage_idx}: Tuning {param_name} ---")
-        tr_list, va_list = [], []
+    print(f"\n=== Step 1: Joint Grid Search (Structure) | {len(combos)} combinations ===")
+    for max_depth, min_samples_split, min_samples_leaf in combos:
+        trial_num += 1
+        params = {
+            'criterion': 'squared_error',
+            'max_depth': max_depth,
+            'min_samples_split': min_samples_split,
+            'min_samples_leaf': min_samples_leaf,
+            'random_state': 42,
+        }
+        model = DecisionTreeRegressor(**params)
+        model.fit(X_train, y_train)
+        t_rmse = rmse_score(y_train, model.predict(X_train))
+        v_rmse = rmse_score(y_val, model.predict(X_val))
 
-        for val in values:
-            test_params = {**current_params, param_name: val}
-            model = DecisionTreeRegressor(**test_params)
-            model.fit(X_train, y_train)
-            t_rmse = rmse_score(y_train, model.predict(X_train))
-            v_rmse = rmse_score(y_val, model.predict(X_val))
-            tr_list.append(t_rmse)
-            va_list.append(v_rmse)
-            print(f"  {param_name}={str(val):<14} | Train RMSE={t_rmse:.4f} | Val RMSE={v_rmse:.4f}")
+        if v_rmse < best_val_rmse:
+            best_val_rmse = v_rmse
+            best_struct = params.copy()
 
-            history_rows.append({
-                'Timestamp': run_time,
-                'Stage': stage_idx,
-                'Parameter': param_name,
-                'Value': str(val),
-                'Train RMSE': round(t_rmse, 4),
-                'Val RMSE': round(v_rmse, 4),
-                'Params Snapshot': json.dumps(test_params, default=str),
-            })
+        print(f"  [{trial_num:03d}/{len(combos)}] depth={max_depth:<2} split={min_samples_split:<3} "
+              f"leaf={min_samples_leaf:<3} | Train={t_rmse:.4f} | Val={v_rmse:.4f}")
 
-        best_val = values[int(np.argmin(va_list))]
-        current_params[param_name] = best_val
-        print(f"  -> Locked {param_name} = {best_val} (Val RMSE={min(va_list):.4f})")
-        plot_stage(values, tr_list, va_list, param_name, best_val, stage_idx)
+        history_rows.append({
+            'Timestamp': run_time,
+            'Search_Method': 'TwoStep_Grid_Search',
+            'Step': 1,
+            'Trial': trial_num,
+            'max_depth': max_depth,
+            'min_samples_split': min_samples_split,
+            'min_samples_leaf': min_samples_leaf,
+            'criterion': 'squared_error',
+            'Train RMSE': t_rmse,
+            'Val RMSE': v_rmse,
+            'Params Snapshot': json.dumps(params, default=str),
+        })
+
+    # Step 2: Compare all split criteria on the winning tree structure (3 fits)
+    print(f"\n=== Step 2: Criterion Comparison on Best Structure "
+          f"(depth={best_struct['max_depth']}, split={best_struct['min_samples_split']}, "
+          f"leaf={best_struct['min_samples_leaf']}) ===")
+    best_crit_val = float('inf')
+    best_params = None
+
+    for criterion in criteria:
+        trial_num += 1
+        params = {**best_struct, 'criterion': criterion}
+        model = DecisionTreeRegressor(**params)
+        model.fit(X_train, y_train)
+        t_rmse = rmse_score(y_train, model.predict(X_train))
+        v_rmse = rmse_score(y_val, model.predict(X_val))
+
+        if v_rmse < best_crit_val:
+            best_crit_val = v_rmse
+            best_params = params.copy()
+
+        print(f"  criterion={criterion:<14} | Train={t_rmse:.4f} | Val={v_rmse:.4f}")
+
+        history_rows.append({
+            'Timestamp': run_time,
+            'Search_Method': 'TwoStep_Grid_Search',
+            'Step': 2,
+            'Trial': trial_num,
+            'max_depth': params['max_depth'],
+            'min_samples_split': params['min_samples_split'],
+            'min_samples_leaf': params['min_samples_leaf'],
+            'criterion': criterion,
+            'Train RMSE': t_rmse,
+            'Val RMSE': v_rmse,
+            'Params Snapshot': json.dumps(params, default=str),
+        })
 
     save_history(history_rows)
+    plot_dt_results(pd.DataFrame(history_rows), best_params)
     print(f"\nSaved tuning history to {HISTORY_FILE}")
-    print(f"Best DT Params: {current_params}")
+    print(f"Best DT Params (Val RMSE={best_crit_val:.4f}): {best_params}")
 
-    final_model = DecisionTreeRegressor(**current_params)
+    final_model = DecisionTreeRegressor(**best_params)
     tracemalloc.start()
     t0 = time.time()
     final_model.fit(X_train, y_train)
@@ -160,7 +288,7 @@ def tune_dt():
         res['train_mem_mb'] = train_mem_mb
         rows.append(res)
 
-    utils.save_results(rows, current_params)
+    utils.save_results(rows, best_params)
     print(f"Saved tuned DT results to {utils.RESULTS_FILE}")
 
 

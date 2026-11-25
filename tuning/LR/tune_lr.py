@@ -101,7 +101,7 @@ def tune_lr():
     stages = [
         ('alpha', [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0], True),
         ('fit_intercept', [True, False], False),
-        ('solver', ['auto', 'svd', 'cholesky', 'lsqr', 'sag'], False),
+        ('solver', ['cholesky','auto', 'svd', 'lsqr'], False),
     ]
 
     current_params = BASELINE_PARAMS.copy()
