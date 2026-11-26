@@ -31,20 +31,20 @@ TUNED_RESULTS_PATH = os.path.join(RESULTS_DIR, 'tuned_model_evaluation_results.c
 
 # Fit randomized trials on a subsample for speed; final fit uses full train
 TUNE_TRAIN_ROWS = 150000
-N_RANDOM_TRIALS = 15
+N_RANDOM_TRIALS = 40
 
 # Categorical params plotted as grouped bar charts
 CATEGORICAL_PARAMS = {'nmf__init', 'ridge__fit_intercept'}
 
-# Parameter distributions for Randomized Search across joint NMF + Ridge knobs
+# All 8 parameters for randomized search
 PARAM_DISTRIBUTIONS = {
-    'nmf__n_components': [10, 20, 30, 40, 45, 50],
+    'nmf__n_components': [10, 20, 30, 40, 50, 60],
     'ridge__alpha': [0.01, 0.1, 1.0, 10.0, 100.0, 500.0],
-    'nmf__alpha_W': [0.0, 0.001, 0.005, 0.01, 0.05],
+    'nmf__alpha_W': [0.0, 0.0005, 0.001, 0.01, 0.05],
     'nmf__l1_ratio': [0.0, 0.25, 0.5, 0.75, 1.0],
     'nmf__init': ['nndsvda', 'nndsvdar'],
-    'nmf__tol': [1e-4, 1e-3],
-    'nmf__max_iter': [300, 500, 800],
+    'nmf__tol': [1e-3, 1e-4],
+    'nmf__max_iter': [200, 400, 600],
     'ridge__fit_intercept': [True, False],
 }
 
@@ -55,10 +55,10 @@ def calc_rmse(y_true, y_pred):
 
 
 # Randomly sample n rows with a fixed seed for faster evaluation
-def sample_rows(X, y, meta_df, n):
+def sample_rows(X, y, meta_df, n, seed=42):
     if n is None or n >= len(y):
         return X, y, meta_df
-    idx = np.random.default_rng(42).choice(len(y), size=n, replace=False)
+    idx = np.random.default_rng(seed).choice(len(y), size=n, replace=False)
     X_sub = X.iloc[idx] if hasattr(X, 'iloc') else X[idx]
     y_sub = y.iloc[idx] if hasattr(y, 'iloc') else y[idx]
     meta_sub = meta_df.iloc[idx].reset_index(drop=True) if meta_df is not None else None
@@ -98,18 +98,18 @@ def append_via_save_results(target_path, rows, full_params):
         utils.RESULTS_FILE = orig_file
 
 
-# Plot trial-by-trial and best-so-far RMSE across Randomized Search iterations
+# Plot trial-by-trial and best-so-far RMSE across randomized search iterations
 def save_random_search_curve(trial_records):
     trials = [r['trial'] for r in trial_records]
     train_rmses = [r['train_rmse'] for r in trial_records]
     val_rmses = [r['val_rmse'] for r in trial_records]
     best_so_far = np.minimum.accumulate(val_rmses)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(9, 5))
     ax.plot(trials, train_rmses, label='Train RMSE', marker='o', alpha=0.75)
     ax.plot(trials, val_rmses, label='Validation RMSE', marker='s', alpha=0.85)
     ax.plot(trials, best_so_far, label='Best Val RMSE So Far', linestyle='--', color='#2CA02C', linewidth=2)
-    ax.set_xlabel('Random Trial')
+    ax.set_xlabel('Trial')
     ax.set_ylabel('RMSE')
     ax.set_title('NMF: Randomized Search Progress')
     ax.set_xticks(trials)
@@ -120,15 +120,20 @@ def save_random_search_curve(trial_records):
     plt.close(fig)
 
 
-# Plot marginal parameter effects across randomized trials (bar for categorical, line for numeric)
+# Plot marginal parameter effects across trials (bar for categorical, line for numeric)
 def save_param_marginal_plots(trial_records, param_names):
     for param_name in param_names:
         clean_name = param_name.replace('__', '_')
         img_stem = clean_name if clean_name.startswith('nmf_') else f"nmf_{clean_name}"
         grouped = {}
         for r in trial_records:
+            if param_name not in r['cfg']:
+                continue
             val = r['cfg'][param_name]
             grouped.setdefault(val, []).append((r['train_rmse'], r['val_rmse']))
+
+        if not grouped:
+            continue
 
         is_categorical = (
             param_name in CATEGORICAL_PARAMS
@@ -137,7 +142,7 @@ def save_param_marginal_plots(trial_records, param_names):
 
         if is_categorical:
             keys = sorted(grouped.keys(), key=lambda x: str(x))
-            x_labels = [str(k) for k in keys]
+            x_labels = [f"{k}\n(n={len(grouped[k])})" for k in keys]
             mean_tr = [float(np.mean([p[0] for p in grouped[k]])) for k in keys]
             mean_va = [float(np.mean([p[1] for p in grouped[k]])) for k in keys]
 
@@ -235,24 +240,20 @@ def tune_nmf():
         # Use train and val splits only; keep test split untouched
         X_train, y_train = splits['train']
         X_val, y_val = splits['val']
-        n_features = X_train.shape[1]
 
-        X_val_tune, y_val_tune, meta_val_tune = sample_rows(X_val, y_val, meta['val'], 50000)
-        X_tr_eval, y_tr_eval, meta_tr_eval = sample_rows(X_train, y_train, meta['train'], 20000)
-
-        # Subsample training rows during random trials for faster exploration
-        X_fit, y_fit, _ = sample_rows(X_train, y_train, None, TUNE_TRAIN_ROWS)
-        print(f"Random trials fit on {len(y_fit)} rows (full train = {len(y_train)})")
+        X_fit, y_fit, _ = sample_rows(X_train, y_train, meta['train'], TUNE_TRAIN_ROWS, seed=42)
+        X_tr_eval, y_tr_eval, meta_tr_eval = sample_rows(X_train, y_train, meta['train'], 20000, seed=42)
+        X_val_tune, y_val_tune, meta_val_tune = sample_rows(X_val, y_val, meta['val'], 50000, seed=42)
+        print(f"Trials fit on {len(y_fit)} rows (full train = {len(y_train)})")
 
         param_space = dict(PARAM_DISTRIBUTIONS)
-        param_space['nmf__n_components'] = [v for v in param_space['nmf__n_components'] if v < n_features]
+        valid_components = [v for v in param_space['nmf__n_components'] if v < X_train.shape[1]]
+        param_space['nmf__n_components'] = valid_components or [max(2, X_train.shape[1] - 1)]
+
         sampled_cfgs = list(ParameterSampler(param_space, n_iter=N_RANDOM_TRIALS, random_state=42))
 
         best_val = float('inf')
-        best_cfg = {
-            **{f"nmf__{k}": v for k, v in NMF_BASELINE.items() if k in param_space},
-            **{f"ridge__{k}": v for k, v in RIDGE_BASELINE.items() if k in param_space},
-        }
+        best_cfg = {}
         trial_records = []
 
         for idx, cfg in enumerate(sampled_cfgs, start=1):
@@ -286,6 +287,7 @@ def tune_nmf():
                 'ridge': {**RIDGE_BASELINE, **ridge_cfg},
             }
             append_via_save_results(HISTORY_CSV, trial_rows, used)
+            print(f"  -> Train RMSE: {train_rmse:.4f} | Val RMSE: {val_rmse:.4f} | Gap: {gap:.4f} | fit {fit_time:.1f}s")
 
             trial_records.append({
                 'trial': idx,
@@ -293,9 +295,6 @@ def tune_nmf():
                 'train_rmse': train_rmse,
                 'val_rmse': val_rmse,
             })
-
-            print(f"  -> Train RMSE: {train_rmse:.4f} | Val RMSE: {val_rmse:.4f} | Gap: {gap:.4f} | fit {fit_time:.1f}s")
-
             if val_rmse < best_val:
                 best_val = val_rmse
                 best_cfg = dict(cfg)
