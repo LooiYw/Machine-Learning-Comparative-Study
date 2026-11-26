@@ -28,6 +28,10 @@ def rmse_score(y_true, y_pred):
     return float(np.sqrt(mean_squared_error(y_true, np.clip(y_pred, 1, 5))))
 
 
+def _take_rows(data, idx):
+    return data.iloc[idx] if hasattr(data, 'iloc') else data[idx]
+
+
 def save_history(rows):
     df_hist = pd.DataFrame(rows)
     df_hist['Train RMSE'] = df_hist['Train RMSE'].round(4)
@@ -40,26 +44,23 @@ def plot_dt_results(df_run, best_params):
     df_step1 = df_run[df_run['Step'] == 1]
     df_step2 = df_run[df_run['Step'] == 2]
 
-    # 1. Heatmap: max_depth vs min_samples_leaf (at best min_samples_split)
-    sub_hm = df_step1[df_step1['min_samples_split'] == best_params['min_samples_split']]
-    pivot = sub_hm.pivot(index='max_depth', columns='min_samples_leaf', values='Val RMSE')
+    # 1. Multi-Line Grid Search Plot: Validation RMSE vs min_samples_leaf per max_depth
+    sub_grid = df_step1[df_step1['min_samples_split'] == best_params['min_samples_split']]
+    leaf_vals = sorted(sub_grid['min_samples_leaf'].unique())
+    x_pos = np.arange(len(leaf_vals))
 
-    plt.figure(figsize=(9, 5.5))
-    im = plt.imshow(pivot.values, cmap='viridis_r', aspect='auto')
-    plt.colorbar(im, label='Validation RMSE')
-    plt.xticks(range(len(pivot.columns)), pivot.columns)
-    plt.yticks(range(len(pivot.index)), pivot.index)
+    plt.figure(figsize=(8.5, 5))
+    for depth in sorted(sub_grid['max_depth'].unique()):
+        sub_d = sub_grid[sub_grid['max_depth'] == depth].sort_values('min_samples_leaf')
+        plt.plot(x_pos, sub_d['Val RMSE'].values, marker='o', label=f'max_depth={depth}')
+
+    plt.xticks(x_pos, [str(v) for v in leaf_vals])
+    plt.title('Decision Tree: Grid Search Validation RMSE')
     plt.xlabel('min_samples_leaf')
-    plt.ylabel('max_depth')
-    plt.title(f"Decision Tree Grid Search Heatmap (min_samples_split={best_params['min_samples_split']})")
-
-    for i in range(len(pivot.index)):
-        for j in range(len(pivot.columns)):
-            val = pivot.values[i, j]
-            plt.text(j, i, f"{val:.4f}", ha='center', va='center',
-                     color='white' if val > pivot.values.mean() else 'black', fontsize=8.5)
-
-    plt.savefig(os.path.join(PLOTS_DIR, 'dt_grid_heatmap.png'), dpi=300, bbox_inches='tight')
+    plt.ylabel('Validation RMSE')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig(os.path.join(PLOTS_DIR, 'dt_grid_search_lines.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
     # 2. Top-10 Structural Configurations Bar Chart (Train vs Val RMSE)
@@ -122,7 +123,7 @@ def plot_dt_results(df_run, best_params):
         plt.xticks(x_pos, [str(v) for v in values])
         plt.margins(y=0.15)
         if param_name in ('min_samples_split', 'min_samples_leaf'):
-            plt.xlabel(f"{param_name}  (← Higher Complexity | Stronger Regularization →)")
+            plt.xlabel(f"{param_name}  (<- Higher Complexity | Stronger Regularization ->)")
         else:
             plt.xlabel(param_name)
         plt.ylabel('RMSE')
@@ -165,15 +166,60 @@ def plot_dt_results(df_run, best_params):
     plt.close()
 
 
+def plot_learning_curve(best_params, X_train_raw, y_train, X_val_raw, y_val,
+                        final_train_rmse, final_val_rmse):
+    print("\n--- Generating Learning Curve (RMSE vs. Training Set Size) ---")
+    n_total = len(y_train)
+    rng = np.random.RandomState(42)
+    shuffled_idx = rng.permutation(n_total)
+
+    sizes, tr_list, va_list = [], [], []
+    for frac in [0.2, 0.4, 0.6, 0.8, 1.0]:
+        if frac == 1.0:
+            n_sub = n_total
+            t_r, v_r = final_train_rmse, final_val_rmse
+        else:
+            n_sub = int(round(n_total * frac))
+            sub_idx = shuffled_idx[:n_sub]
+            imp = SimpleImputer(strategy='mean')
+            X_sub = imp.fit_transform(_take_rows(X_train_raw, sub_idx))
+            y_sub = _take_rows(y_train, sub_idx)
+            X_val_cur = imp.transform(X_val_raw)
+
+            m = DecisionTreeRegressor(**best_params)
+            m.fit(X_sub, y_sub)
+            t_r = rmse_score(y_sub, m.predict(X_sub))
+            v_r = rmse_score(y_val, m.predict(X_val_cur))
+
+        sizes.append(n_sub)
+        tr_list.append(t_r)
+        va_list.append(v_r)
+        print(f"  Size={n_sub:<7} ({int(frac * 100):>3}%) | Train={t_r:.4f} | Val={v_r:.4f}")
+
+    plt.figure(figsize=(8.5, 5))
+    plt.plot(sizes, tr_list, marker='o', color='#1f77b4', label='Train RMSE')
+    plt.plot(sizes, va_list, marker='s', color='#ff7f0e', label='Validation RMSE')
+    plt.title('Decision Tree: Learning Curve')
+    plt.xlabel('Training Set Size')
+    plt.ylabel('RMSE')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig(os.path.join(PLOTS_DIR, 'dt_learning_curve.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def tune_dt():
     df = load_ratings_scaled()
     splits, meta = utils.get_splits(df)
 
+    X_train_raw, y_train = splits['train']
+    X_val_raw, y_val = splits['val']
+    X_test_raw, y_test = splits['test']
+
     imputer = SimpleImputer(strategy='mean')
-    X_train, y_train = splits['train']
-    X_train = imputer.fit_transform(X_train)
-    X_val, y_val = imputer.transform(splits['val'][0]), splits['val'][1]
-    X_test, y_test = imputer.transform(splits['test'][0]), splits['test'][1]
+    X_train = imputer.fit_transform(X_train_raw)
+    X_val = imputer.transform(X_val_raw)
+    X_test = imputer.transform(X_test_raw)
 
     # Step 1: Joint grid over interacting structural parameters (4 x 7 x 6 = 168 combos)
     param_grid = {
@@ -279,6 +325,11 @@ def tune_dt():
     _, peak_mem = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     train_mem_mb = peak_mem / 1e6
+
+    final_train_rmse = rmse_score(y_train, final_model.predict(X_train))
+    final_val_rmse = rmse_score(y_val, final_model.predict(X_val))
+    plot_learning_curve(best_params, X_train_raw, y_train, X_val_raw, y_val,
+                        final_train_rmse, final_val_rmse)
 
     rows = []
     for split_name, (X, y) in [('train', (X_train, y_train)), ('val', (X_val, y_val)), ('test', (X_test, y_test))]:

@@ -34,6 +34,10 @@ def rmse_score(y_true, y_pred):
     return float(np.sqrt(mean_squared_error(y_true, np.clip(y_pred, 1, 5))))
 
 
+def _take_rows(data, idx):
+    return data.iloc[idx] if hasattr(data, 'iloc') else data[idx]
+
+
 def save_history(rows):
     df_hist = pd.DataFrame(rows)
     write_header = not os.path.exists(HISTORY_FILE)
@@ -88,20 +92,86 @@ def plot_stage(values, train_rmses, val_rmses, param_name, best_val, stage_idx, 
     plt.close()
 
 
+def plot_search_progress(history_rows):
+    df_run = pd.DataFrame(history_rows)
+    trials = np.arange(1, len(df_run) + 1)
+    tr_rmses = df_run['Train RMSE'].values
+    va_rmses = df_run['Val RMSE'].values
+    best_so_far = np.minimum.accumulate(va_rmses)
+
+    plt.figure(figsize=(8.5, 5))
+    plt.plot(trials, tr_rmses, marker='o', color='#1f77b4', label='Train RMSE')
+    plt.plot(trials, va_rmses, marker='s', color='#ff7f0e', label='Validation RMSE')
+    plt.plot(trials, best_so_far, linestyle='--', color='#2ca02c', linewidth=2,
+             label=f'Best Val RMSE So Far ({best_so_far[-1]:.4f})')
+    plt.title('Ridge Regression: Sequential Search Progress')
+    plt.xlabel('Sequential Trial')
+    plt.ylabel('RMSE')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig(os.path.join(PLOTS_DIR, 'lr_search_progress.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_learning_curve(best_params, X_train_raw, y_train, X_val_raw, y_val,
+                        final_train_rmse, final_val_rmse):
+    print("\n--- Generating Learning Curve (RMSE vs. Training Set Size) ---")
+    n_total = len(y_train)
+    rng = np.random.RandomState(42)
+    shuffled_idx = rng.permutation(n_total)
+
+    sizes, tr_list, va_list = [], [], []
+    for frac in [0.2, 0.4, 0.6, 0.8, 1.0]:
+        if frac == 1.0:
+            n_sub = n_total
+            t_r, v_r = final_train_rmse, final_val_rmse
+        else:
+            n_sub = int(round(n_total * frac))
+            sub_idx = shuffled_idx[:n_sub]
+            imp = SimpleImputer(strategy='mean')
+            X_sub = imp.fit_transform(_take_rows(X_train_raw, sub_idx))
+            y_sub = _take_rows(y_train, sub_idx)
+            X_val_cur = imp.transform(X_val_raw)
+
+            m = Ridge(**best_params)
+            m.fit(X_sub, y_sub)
+            t_r = rmse_score(y_sub, m.predict(X_sub))
+            v_r = rmse_score(y_val, m.predict(X_val_cur))
+
+        sizes.append(n_sub)
+        tr_list.append(t_r)
+        va_list.append(v_r)
+        print(f"  Size={n_sub:<7} ({int(frac * 100):>3}%) | Train={t_r:.4f} | Val={v_r:.4f}")
+
+    plt.figure(figsize=(8.5, 5))
+    plt.plot(sizes, tr_list, marker='o', color='#1f77b4', label='Train RMSE')
+    plt.plot(sizes, va_list, marker='s', color='#ff7f0e', label='Validation RMSE')
+    plt.title('Ridge Regression: Learning Curve')
+    plt.xlabel('Training Set Size')
+    plt.ylabel('RMSE')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig(os.path.join(PLOTS_DIR, 'lr_learning_curve.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def tune_lr():
     df = load_ratings_scaled()
     splits, meta = utils.get_splits(df)
 
+    X_train_raw, y_train = splits['train']
+    X_val_raw, y_val = splits['val']
+    X_test_raw, y_test = splits['test']
+
     imputer = SimpleImputer(strategy='mean')
-    X_train, y_train = splits['train']
-    X_train = imputer.fit_transform(X_train)
-    X_val, y_val = imputer.transform(splits['val'][0]), splits['val'][1]
-    X_test, y_test = imputer.transform(splits['test'][0]), splits['test'][1]
+    X_train = imputer.fit_transform(X_train_raw)
+    X_val = imputer.transform(X_val_raw)
+    X_test = imputer.transform(X_test_raw)
 
     stages = [
         ('alpha', [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0], True),
         ('fit_intercept', [True, False], False),
-        ('solver', ['cholesky','auto', 'svd', 'lsqr'], False),
+        ('solver', ['cholesky', 'auto', 'svd', 'lsqr'], False),
     ]
 
     current_params = BASELINE_PARAMS.copy()
@@ -139,6 +209,7 @@ def tune_lr():
         plot_stage(values, tr_list, va_list, param_name, best_val, stage_idx, log_x)
 
     save_history(history_rows)
+    plot_search_progress(history_rows)
     print(f"\nSaved tuning history to {HISTORY_FILE}")
     print(f"Best LR Params: {current_params}")
 
@@ -150,6 +221,11 @@ def tune_lr():
     _, peak_mem = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     train_mem_mb = peak_mem / 1e6
+
+    final_train_rmse = rmse_score(y_train, final_model.predict(X_train))
+    final_val_rmse = rmse_score(y_val, final_model.predict(X_val))
+    plot_learning_curve(current_params, X_train_raw, y_train, X_val_raw, y_val,
+                        final_train_rmse, final_val_rmse)
 
     rows = []
     for split_name, (X, y) in [('train', (X_train, y_train)), ('val', (X_val, y_val)), ('test', (X_test, y_test))]:

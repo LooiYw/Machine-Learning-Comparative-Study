@@ -24,13 +24,17 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 
 utils.RESULTS_FILE = os.path.join('results', 'tuned_model_evaluation_results.csv')
 
-N_TRIALS = 25
+N_TRIALS = 50
 MAX_ESTIMATORS = 2000
 EARLY_STOPPING_ROUNDS = 50
 
 
 def rmse_score(y_true, y_pred):
     return float(np.sqrt(mean_squared_error(y_true, np.clip(y_pred, 1, 5))))
+
+
+def _take_rows(data, idx):
+    return data.iloc[idx] if hasattr(data, 'iloc') else data[idx]
 
 
 def save_history(rows):
@@ -67,6 +71,7 @@ def plot_optuna_results(df_run, study):
             w = bar.get_width()
             plt.annotate(f"{w:.3f}", (w, bar.get_y() + bar.get_height() / 2),
                          textcoords="offset points", xytext=(4, 0), va='center', fontsize=8.5)
+        plt.xlim(0, max(scores) * 1.18)
         plt.title('XGBoost Hyperparameter Importance (fANOVA)')
         plt.xlabel('Relative Importance')
         plt.grid(True, axis='x', linestyle='--', alpha=0.6)
@@ -74,6 +79,46 @@ def plot_optuna_results(df_run, study):
         plt.close()
     except Exception as e:
         print(f"  [Info] Skipped importance plot: {e}")
+
+
+def plot_learning_curve(final_params, X_train, y_train, X_val, y_val,
+                        final_train_rmse, final_val_rmse):
+    print("\n--- Generating Learning Curve (RMSE vs. Training Set Size) ---")
+    n_total = len(y_train)
+    rng = np.random.RandomState(42)
+    shuffled_idx = rng.permutation(n_total)
+
+    sizes, tr_list, va_list = [], [], []
+    for frac in [0.2, 0.4, 0.6, 0.8, 1.0]:
+        if frac == 1.0:
+            n_sub = n_total
+            t_r, v_r = final_train_rmse, final_val_rmse
+        else:
+            n_sub = int(round(n_total * frac))
+            sub_idx = shuffled_idx[:n_sub]
+            X_sub = _take_rows(X_train, sub_idx)
+            y_sub = _take_rows(y_train, sub_idx)
+
+            m = XGBRegressor(**final_params)
+            m.fit(X_sub, y_sub)
+            t_r = rmse_score(y_sub, m.predict(X_sub))
+            v_r = rmse_score(y_val, m.predict(X_val))
+
+        sizes.append(n_sub)
+        tr_list.append(t_r)
+        va_list.append(v_r)
+        print(f"  Size={n_sub:<7} ({int(frac * 100):>3}%) | Train={t_r:.4f} | Val={v_r:.4f}")
+
+    plt.figure(figsize=(8.5, 5))
+    plt.plot(sizes, tr_list, marker='o', color='#1f77b4', label='Train RMSE')
+    plt.plot(sizes, va_list, marker='s', color='#ff7f0e', label='Validation RMSE')
+    plt.title('XGBoost: Learning Curve')
+    plt.xlabel('Training Set Size')
+    plt.ylabel('RMSE')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig(os.path.join(PLOTS_DIR, 'xgb_learning_curve.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
 
 def tune_xgb():
@@ -164,7 +209,7 @@ def tune_xgb():
     tracemalloc.stop()
     train_mem_mb = peak_mem / 1e6
 
-    # Separate untimed pass to save clean Boosting Learning Curve
+    # 1. Boosting Rounds Training Curve (RMSE vs. n_estimators)
     curve_model = XGBRegressor(**final_params)
     curve_model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_val, y_val)], verbose=False)
     evals_result = curve_model.evals_result()
@@ -172,13 +217,19 @@ def tune_xgb():
     plt.figure(figsize=(8.5, 5))
     plt.plot(rounds, evals_result['validation_0']['rmse'], label='Train RMSE')
     plt.plot(rounds, evals_result['validation_1']['rmse'], label='Validation RMSE')
-    plt.title(f'XGBoost Final Learning Curve (Optimal Trees={best_n_est})')
+    plt.title(f'XGBoost Training Curve (Optimal Trees={best_n_est})')
     plt.xlabel('Boosting Rounds (n_estimators)')
     plt.ylabel('RMSE')
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.6)
-    plt.savefig(os.path.join(PLOTS_DIR, 'xgb_learning_curve.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(PLOTS_DIR, 'xgb_boosting_curve.png'), dpi=300, bbox_inches='tight')
     plt.close()
+
+    # 2. Learning Curve (RMSE vs. Training Set Size) to match other models
+    final_train_rmse = rmse_score(y_train, final_model.predict(X_train))
+    final_val_rmse = rmse_score(y_val, final_model.predict(X_val))
+    plot_learning_curve(final_params, X_train, y_train, X_val, y_val,
+                        final_train_rmse, final_val_rmse)
 
     rows = []
     for split_name, (X, y) in [('train', (X_train, y_train)), ('val', (X_val, y_val)), ('test', (X_test, y_test))]:
