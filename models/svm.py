@@ -12,17 +12,16 @@ from sklearn.svm import LinearSVR
 from preprocessing import load_ratings_preprocessed, load_ratings_scaled
 from utils import get_splits, evaluate, save_results
 
-# Values are sklearn defaults unless marked "original"
 BASELINE_PARAMS = dict(
     epsilon=0.0,
     tol=1e-4,
-    C=1.0,                                # main value to tune
-    loss='squared_epsilon_insensitive',   # original (sklearn default is 'epsilon_insensitive')
+    C=1.0,
+    loss='epsilon_insensitive',
     fit_intercept=True,
     intercept_scaling=1.0,
-    dual=False,                           # original (needs the squared loss above)
-    random_state=42,                      # original, so results can be repeated
-    max_iter=2000,                        # original (sklearn default is 1000)
+    dual='auto',
+    random_state=42,
+    max_iter=1000,
 )
 
 # Columns that are NOT used as model inputs

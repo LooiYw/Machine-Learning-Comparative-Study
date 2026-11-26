@@ -11,9 +11,9 @@ from sklearn.pipeline import Pipeline
 from preprocessing import load_ratings_preprocessed, load_ratings_scaled
 from utils import get_splits, evaluate, save_results
 
-# Values are sklearn defaults unless marked "original"
+# Values are sklearn defaults
 BASELINE_PARAMS = dict(
-    n_neighbors=5,      # original value (sklearn default is 5)
+    n_neighbors=5,
     weights='uniform',
     algorithm='auto',
     leaf_size=30,

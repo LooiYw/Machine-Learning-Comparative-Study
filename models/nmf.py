@@ -14,23 +14,25 @@ from sklearn.preprocessing import MinMaxScaler
 from preprocessing import load_ratings_preprocessed, load_ratings_scaled
 from utils import get_splits, evaluate, save_results
 
-# Values are sklearn defaults unless marked "original"
+# Values are sklearn defaults
 NMF_BASELINE = dict(
-    n_components=20,      # original (sklearn default is all features)
-    init='nndsvda',       # original
+    n_components=None,
+    init=None,
     solver='cd',
+    beta_loss='frobenius',
     tol=1e-4,
-    max_iter=500,         # original (sklearn default is 200)
+    max_iter=200,
     alpha_W=0.0,
+    alpha_H='same',
     l1_ratio=0.0,
-    random_state=42,      # original, so results can be repeated
+    random_state=42,
 )
 
 RIDGE_BASELINE = dict(
-    alpha=1.0,            # main value to tune
+    alpha=1.0,
     fit_intercept=True,
     solver='auto',
-    random_state=42,      # original (only used by some solvers)
+    random_state=42,
 )
 
 # Columns that are NOT used as model inputs

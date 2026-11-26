@@ -13,21 +13,22 @@ from sklearn.pipeline import Pipeline
 from preprocessing import load_ratings_preprocessed, load_ratings_scaled
 from utils import get_splits, evaluate, save_results
 
-# Values are sklearn defaults unless marked "original"
+# Values are sklearn defaults
 SVD_BASELINE = dict(
-    n_components=20,                      # original (sklearn default is 2)
+    n_components=2,
     algorithm='randomized',
     n_iter=5,
     n_oversamples=10,
     power_iteration_normalizer='auto',
-    random_state=42,                      # original, so results can be repeated
+    random_state=42,
+    tol=0.0,
 )
 
 RIDGE_BASELINE = dict(
-    alpha=1.0,                            # main value to tune
+    alpha=1.0,                          
     fit_intercept=True,
     solver='auto',
-    random_state=42,                      # original (only used by some solvers)
+    random_state=42,
 )
 
 # Columns that are NOT used as model inputs
