@@ -13,6 +13,7 @@ NON_FEATURE_COLS = ['userId', 'movieId', 'rating', 'split']
 # Path where the final evaluation results are saved
 RESULTS_FILE = os.path.join('results', 'model_evaluation_results.csv')
 TUNING_RESULTS_FILE = os.path.join('results', 'tuned_model_evaluation_results.csv')
+TUNING_RESULTS_FILE = os.path.join('results', 'tuned_model_evaluation_results.csv')
 
 # Separates features (X) and target ratings (y), and retains metadata for ranking metrics
 def get_splits(df):
@@ -217,7 +218,8 @@ def save_results(rows, params):
     # Create a new header only if the file does not exist yet
     write_header = not os.path.exists(RESULTS_FILE)
     out.to_csv(RESULTS_FILE, mode='a', header=write_header, index=False)
-    
+
+
 def save_tuning_results(rows, params):
     os.makedirs(os.path.dirname(TUNING_RESULTS_FILE), exist_ok=True)
     out = pd.DataFrame(rows)
