@@ -146,13 +146,12 @@ def tune_rf():
 
     X_train_raw, y_train = splits['train']
     X_val_raw, y_val = splits['val']
-    X_test_raw, y_test = splits['test']
+    
 
     imputer = SimpleImputer(strategy='mean')
     X_train = imputer.fit_transform(X_train_raw)
     X_val = imputer.transform(X_val_raw)
-    X_test = imputer.transform(X_test_raw)
-
+    
     run_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     history_rows = []
 
@@ -250,7 +249,7 @@ def tune_rf():
                         final_train_rmse, final_val_rmse)
 
     rows = []
-    for split_name, (X, y) in [('train', (X_train, y_train)), ('val', (X_val, y_val)), ('test', (X_test, y_test))]:
+    for split_name, (X, y) in [('train', (X_train, y_train)), ('val', (X_val, y_val))]:
         res = utils.evaluate(split_name, final_model, X, y, meta[split_name])
         res['model'] = "RF_scaled"
         res['train_time_s'] = train_time

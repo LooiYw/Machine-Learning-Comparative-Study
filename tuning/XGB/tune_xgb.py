@@ -128,7 +128,6 @@ def tune_xgb():
     # XGBoost handles cold-start NaNs natively
     X_train, y_train = splits['train']
     X_val, y_val = splits['val']
-    X_test, y_test = splits['test']
 
     run_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     history_rows = []
@@ -232,7 +231,7 @@ def tune_xgb():
                         final_train_rmse, final_val_rmse)
 
     rows = []
-    for split_name, (X, y) in [('train', (X_train, y_train)), ('val', (X_val, y_val)), ('test', (X_test, y_test))]:
+    for split_name, (X, y) in [('train', (X_train, y_train)), ('val', (X_val, y_val))]:
         res = utils.evaluate(split_name, final_model, X, y, meta[split_name])
         res['model'] = "XGB_scaled"
         res['train_time_s'] = train_time
