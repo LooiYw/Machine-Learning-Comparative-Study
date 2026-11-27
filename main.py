@@ -1,8 +1,8 @@
 import os
-from models.knn import run_knn
-from models.svm import run_svm
-from models.svd import run_svd
-from models.nmf import run_nmf
+#from models.knn import run_knn
+#from models.svm import run_svm
+#from models.svd import run_svd
+#from models.nmf import run_nmf
 from models.dt import run_dt
 from models.rf import run_rf
 from models.xgb import run_xgb
@@ -17,10 +17,10 @@ def main():
         os.remove(results_file)
         print(f"[*] Deleted old results file. Starting fresh!\n")
     
-    run_knn()
-    run_svm()
-    run_svd()
-    run_nmf()
+    #run_knn()
+    #run_svm()
+    #run_svd()
+    #run_nmf()
     run_dt()
     run_lr()
     run_xgb()
